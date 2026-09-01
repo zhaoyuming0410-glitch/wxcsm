@@ -147,6 +147,9 @@ wxcsm/
 ├── installer_main.py     Windows 安装向导本体
 ├── make_macos.py         macOS 安装包构建（产出 .app / .dmg，需在 Mac 运行）
 ├── installer_macos.py    macOS 安装向导本体
+├── .github/workflows/build-macos.yml   GitHub Actions 自动构建 macOS 包
+├── push_via_api.py       受限网络下用 API 上传仓库（替代 git push）
+├── wait_download.py      监控构建并下载/校验 artifact（开发辅助）
 └── core/
     ├── models.py         数据模型
     ├── pipeline.py       业务流水线（GUI 与 CLI 共用）
@@ -216,9 +219,19 @@ wxcsm 的 GUI 与引擎（`app.py` / `cli.py` / `core/`）本身是跨平台的�
    - 可选 `微信客户沟通总结工具安装向导.dmg`
 4. 收件人双击「安装向导.app」→ 选安装目录（默认 `~/Applications`，免管理员权限）→ 安装 → 双击生成的「微信客户沟通总结工具.app」即可使用；WeChatDataAnalysis 在首次使用时由按钮打开内嵌安装包，按提示装到 `/Applications`。
 
+### 自动构建（GitHub Actions，无需本地 Mac）
+
+仓库已配置 `.github/workflows/build-macos.yml`：把代码 push 到 `main` 分支，或在 Actions 页手动 **Run workflow**，GitHub 托管的 macOS runner 会自动跑 `make_macos.py --dmg`，把产物（`.app` + `.dmg`）作为 Actions Artifact（名称 `wxcsm-macos`）上传。
+
+- **CI 产出的是「不含 WDA」的精简版**：`tools/` 被 `.gitignore` 忽略，WeChatDataAnalysis 安装包体积大、不适合进 git。需要内嵌 WDA 的全量版，请在自己 Mac 上放好包后本地 `python make_macos.py`（见上）。
+- **下载**：Actions 页 → 对应 run → Artifacts → 下载 `wxcsm-macos.zip`（内含 `微信客户沟通总结工具安装向导.app` 与 `.dmg`）。在 Mac 上双击 `.app` 即安装向导；或挂`载`.dmg 拖拽到 `Applications`。
+- 工作流需要能写 `.github/workflows/` 的 token 权限（classic PAT 需勾选 `workflow` 作用域）。
+
 ### 备注
 
 - **未签名 .app** 在 Mac 上首次打开可能被 Gatekeeper 拦截：右键「打开」一次放行，或在终端执行
   `xattr -dr com.apple.quarantine 微信客户沟通总结工具.app` 解除隔离。
 - **卸载**：运行「微信客户沟通总结工具.app」内的「卸载.command」。
 - 构建相关脚本：`make_macos.py`（构建）、`installer_macos.py`（安装向导本体）。
+- 安装包内部实现：向导 `.app` 把业务程序「启动工具.app」以 `Contents/Resources/wxcsm_payload.bin`（XOR 混淆的 zip）形式内嵌，安装时解压到目标 `.app`；改动 Mach-O 会破坏 ad-hoc 签名，故 payload 不放可执行尾部。
+- 仓库与 CI 由一次性 Personal Access Token 配置完成，**建议用完后到 GitHub → Settings → Developer settings → Personal access tokens 撤销该 token**，避免长期泄露。
