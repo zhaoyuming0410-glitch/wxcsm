@@ -196,9 +196,10 @@ def _pack_payload() -> bytes:
         for root, _dirs, files in os.walk(real_app):
             for fn in files:
                 full = os.path.join(root, fn)
-                rel = os.path.relpath(full, OUT_DIR)
-                # 统一用正斜杠，安装端按 / 切分还原
-                z.write(full, rel.replace(os.sep, "/"))
+                # 以 .app 根为起点（Contents/...、卸载.command），安装端直接落到目标 .app 下，
+                # 不要带 wxcsm_app/ 前缀，否则安装后的 .app 会被错误地嵌套一层。
+                rel = os.path.relpath(full, real_app).replace(os.sep, "/")
+                z.write(full, rel)
     data = buf.getvalue()
     print(f"      payload 大小：{len(data)/1024/1024:.1f} MB")
     return data
