@@ -18,6 +18,7 @@
   python make_macos.py            # 全量：内嵌 WDA 安装包
   python make_macos.py --no-wda  # 精简：不含 WDA 安装包
   python make_macos.py --dmg     # 额外打成 .dmg
+  python make_macos.py --dmg --wda-url <直链>   # CI 用：自动下载并内嵌 WDA
 
 注意：Windows 无法生成 macOS 可执行文件，本脚本会直接拒绝运行。
 """
@@ -30,6 +31,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import urllib.request
 import zipfile
 
 if sys.platform != "darwin":
@@ -80,6 +82,35 @@ def _wda_installer_files() -> list:
         if os.path.isfile(p) and fn.lower().endswith((".dmg", ".pkg", ".zip")):
             out.append(p)
     return out
+
+
+def _download_wda(url: str) -> None:
+    """从直链下载 macOS 版 WeChatDataAnalysis 安装包到 tools/wechatdataanalysis/。
+
+    用于 CI：云端 runner 无法预置 423MB 的 WDA 包，构建时按 --wda-url 现下现嵌。
+    """
+    os.makedirs(WDA_DIR, exist_ok=True)
+    fn = os.path.basename(url.split("?")[0].rstrip("/"))
+    if not fn.lower().endswith((".dmg", ".pkg", ".zip")):
+        fn += ".dmg"
+    dst = os.path.join(WDA_DIR, fn)
+    if os.path.isfile(dst):
+        print(f"[预] 已存在 WDA 包，跳过下载：{dst}")
+        return
+    print(f"[预] 下载 WeChatDataAnalysis 安装包：\n      {url}\n      -> {dst}")
+    req = urllib.request.Request(url, headers={"User-Agent": "wxcsm-build"})
+    with urllib.request.urlopen(req, timeout=600) as r, open(dst, "wb") as out:
+        total = int(r.headers.get("Content-Length", "0") or "0")
+        got = 0
+        while True:
+            chunk = r.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            got += len(chunk)
+            if total:
+                print(f"      下载进度 {got * 100 // total}%", end="\r")
+    print(f"\n      WDA 下载完成：{os.path.getsize(dst)/1024/1024:.1f} MB")
 
 
 def _run(cmd: list) -> None:
@@ -241,9 +272,17 @@ def _make_dmg() -> None:
 
 
 def main() -> int:
-    include_wda = "--no-wda" not in sys.argv
+    wda_url = None
+    for i, a in enumerate(sys.argv):
+        if a == "--wda-url" and i + 1 < len(sys.argv):
+            wda_url = sys.argv[i + 1]
     make_dmg = "--dmg" in sys.argv
     os.makedirs(OUT_DIR, exist_ok=True)
+    if wda_url:
+        _download_wda(wda_url)
+        include_wda = True
+    else:
+        include_wda = "--no-wda" not in sys.argv
     if include_wda:
         n = len(_wda_installer_files())
         if n == 0:
