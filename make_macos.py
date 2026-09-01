@@ -143,7 +143,10 @@ def _build_real_app(include_wda: bool) -> None:
            "--workpath", real_build,
            "--specpath", OUT_DIR]
     if include_wda and _wda_installer_files():
-        cmd += ["--add-data", f"{WDA_DIR}:tools/wechatdataanalysis"]
+        # 注意：目标必须是 `wechatdataanalysis`（不是 `tools/wechatdataanalysis`）。
+        # 运行时 wda_launcher._frozen_resources_dir 在 macOS 上查
+        # Contents/Resources/wechatdataanalysis，多一层 tools/ 会找不到内嵌安装包。
+        cmd += ["--add-data", f"{WDA_DIR}:wechatdataanalysis"]
     _run(cmd)
 
     src_app = os.path.join(real_dist, f"{REAL_BUILD_NAME}.app")
