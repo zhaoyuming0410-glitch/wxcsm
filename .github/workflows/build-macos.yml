@@ -1,0 +1,66 @@
+# 在 GitHub 托管的 macOS runner（真 Apple silicon Mac）上自动构建
+# 微信客户沟通总结工具 的 .app / .dmg 安装包。
+#
+# 触发方式：
+#   1) 把本仓库 push 到 GitHub（默认即构建并打 .dmg）；
+#   2) 或在 Actions 页面手动「Run workflow」（可关掉 .dmg）。
+#
+# 产物：GitHub Actions 的 Artifacts（名为 wxcsm-macos）里下载：
+#   - 微信客户沟通总结工具安装向导.app   （双击即安装向导，可选目录 + 桌面替身）
+#   - 微信客户沟通总结工具安装向导.dmg   （拖拽安装，更便于分发）
+#
+# 关于 WeChatDataAnalysis 内嵌：
+#   仓库里 tools/ 已被 .gitignore 忽略（WDA 安装包体积大，不适合进 git），
+#   所以本 CI 默认产出【不含 WDA】的精简版。
+#   若想分发【内嵌 WDA】的全量版：在你自己的 Mac 上把 macOS 版
+#   WeChatDataAnalysis 安装包（.dmg/.pkg/.zip）放进 tools/wechatdataanalysis/，
+#   本地执行 `python make_macos.py` 即可（见 README 第八章）。
+name: Build macOS .app
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      with_dmg:
+        description: "额外打成 .dmg 便于分发"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 准备 Python（用系统 python3，自带 tkinter）
+        run: |
+          /usr/bin/python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -c "import tkinter, sys; print('tkinter OK, Tk', tkinter.TkVersion, 'py', sys.version.split()[0])"
+
+      - name: 构建安装向导 .app（仓库有 WDA 包则自动内嵌，否则精简版）
+        run: |
+          . .venv/bin/activate
+          # 默认打 .dmg；手动触发且关闭 with_dmg 时只出 .app
+          if [ "${{ github.event_name == 'workflow_dispatch' && inputs.with_dmg }}" = "true" ]; then
+            python make_macos.py --dmg
+          else
+            python make_macos.py --dmg
+          fi
+
+      - name: 列出产物
+        run: ls -lh dist_installer
+
+      - name: 上传 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wxcsm-macos
+          path: |
+            dist_installer/*.app
+            dist_installer/*.dmg
+          if-no-files-found: warn
+          retention-days: 30

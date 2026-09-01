@@ -1,0 +1,21 @@
+
+# 第三方工具（用户自行下载的 exe，不进版本库）
+tools/
+
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# PyInstaller 安装包产物（含巨大的 Windows Setup.exe，绝不进版本库）
+dist_installer/
+.venv/
+venv/
+.DS_Store
+
+# 本地运行/构建临时产物（不进版本库）
+启动工具.exe
+启动工具.bat
+_ai_batch_test.xlsx
+_ai_real_test.xlsx
