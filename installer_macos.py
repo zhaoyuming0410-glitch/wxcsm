@@ -160,15 +160,18 @@ class Installer(tk.Tk):
             self.btn_install.configure(state="normal")
 
     def _extract(self, dest_app: str) -> None:
-        """把 payload 里的 启动工具.app 解压到 dest_app（覆盖同名）。"""
+        """把 payload 里的 启动工具.app 内容解压到 dest_app（覆盖同名）。
+
+        payload 条目以 .app 根为起点（如 Contents/MacOS/wxcsm、卸载.command），
+        直接落到 dest_app 下，因此 dest_app 即装好的「微信客户沟通总结工具.app」。
+        """
         if os.path.exists(dest_app):
             import shutil
             shutil.rmtree(dest_app)
         names = self._zf.namelist()
         done = 0
         for name in names:
-            # payload 内条目形如 启动工具.app/Contents/...
-            target = os.path.join(dest_app, *name.split("/")) if "/" in name else dest_app
+            target = os.path.join(dest_app, *name.split("/"))
             if name.endswith("/"):
                 os.makedirs(target, exist_ok=True)
                 continue
@@ -189,7 +192,9 @@ class Installer(tk.Tk):
         self._fix_perms(dest_app)
 
     def _fix_perms(self, dest_app: str) -> None:
-        """恢复关键文件的可执行位：Contents/MacOS 下的可执行文件、卸载.command。"""
+        """恢复关键文件的可执行位：Contents/MacOS 下的可执行文件、
+        Contents/Frameworks 内 Python3 框架二进制、卸载.command。
+        （zip 不保留 Unix 权限，macOS 上缺 +x 会导致 app 无法启动。）"""
         macos_dir = os.path.join(dest_app, "Contents", "MacOS")
         if os.path.isdir(macos_dir):
             for fn in os.listdir(macos_dir):
@@ -197,6 +202,15 @@ class Installer(tk.Tk):
                 if os.path.isfile(p):
                     try:
                         os.chmod(p, 0o755)
+                    except OSError:
+                        pass
+        # Frameworks 内的 Python3 框架二进制同样需要可执行位（dylib 多给 +x 无害）
+        fw_dir = os.path.join(dest_app, "Contents", "Frameworks")
+        if os.path.isdir(fw_dir):
+            for root, _dirs, files in os.walk(fw_dir):
+                for fn in files:
+                    try:
+                        os.chmod(os.path.join(root, fn), 0o755)
                     except OSError:
                         pass
         for root, _dirs, files in os.walk(dest_app):
