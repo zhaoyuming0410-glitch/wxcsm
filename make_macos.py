@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import io
 import os
+import plistlib
 import shutil
 import stat
 import subprocess
@@ -87,6 +88,33 @@ def _run(cmd: list) -> None:
     subprocess.run(cmd, cwd=HERE, check=True)
 
 
+def _patch_display(app_path: str, display_name: str) -> None:
+    """把 .app 在 Finder 中显示的中文名写入 Info.plist（CFBundleName/CFBundleDisplayName）。"""
+    ip = os.path.join(app_path, "Contents", "Info.plist")
+    if not os.path.isfile(ip):
+        return
+    try:
+        with open(ip, "rb") as f:
+            pl = plistlib.load(f)
+        pl["CFBundleName"] = display_name
+        pl["CFBundleDisplayName"] = display_name
+        with open(ip, "wb") as f:
+            plistlib.dump(pl, f)
+        print(f"      Info.plist 显示名 -> {display_name}")
+    except Exception as e:
+        print(f"[警告] 写入 Info.plist 失败（不影响构建）：{e}", file=sys.stderr)
+
+
+def _codesign(app_path: str) -> None:
+    """对 .app 做 ad-hoc 重签名，避免修改 Info.plist / 追加 payload 后签名失效。"""
+    try:
+        subprocess.run(["codesign", "--force", "--deep", "--sign", "-", app_path],
+                       cwd=HERE, check=True)
+        print("      codesign (ad-hoc) 完成")
+    except Exception as e:
+        print(f"[警告] codesign 失败，未签名 app 在他人 Mac 上需先放行：{e}", file=sys.stderr)
+
+
 def _verify_entry(exe_path: str, script_name: str) -> bool:
     """校验 PyInstaller onefile/onedir .app 的入口脚本，避免缓存混淆。"""
     try:
@@ -104,7 +132,6 @@ def _build_real_app(include_wda: bool) -> None:
     cmd = [PYINSTALLER, "app.py",
            "--name", REAL_BUILD_NAME,
            "--windowed",
-           "--osx-app-name", "微信客户沟通总结工具",
            "--noconfirm", "--clean",
            "--distpath", real_dist,
            "--workpath", real_build,
@@ -125,6 +152,10 @@ def _build_real_app(include_wda: bool) -> None:
         f.write(UNINSTALL_SH)
     os.chmod(un_path, 0o755)
 
+    # 设置 Finder 中文显示名并重签名（避免改 plist 破坏签名）
+    _patch_display(dst_app, "微信客户沟通总结工具")
+    _codesign(dst_app)
+
     # 校验入口
     exe = os.path.join(dst_app, "Contents", "MacOS", REAL_BUILD_NAME)
     if os.path.isfile(exe) and not _verify_entry(exe, "app"):
@@ -138,12 +169,14 @@ def _build_wizard() -> None:
     cmd = [PYINSTALLER, "installer_macos.py",
            "--name", WIZARD_BUILD_NAME,
            "--windowed",
-           "--osx-app-name", "微信客户沟通总结工具 安装向导",
            "--noconfirm", "--clean",
            "--distpath", wiz_dist,
            "--workpath", wiz_build,
            "--specpath", OUT_DIR]
     _run(cmd)
+    wiz_app = os.path.join(wiz_dist, f"{WIZARD_BUILD_NAME}.app")
+    # 设置 Finder 中文显示名（此时 payload 尚未追加，先改 plist；签名在追加后统一做）
+    _patch_display(wiz_app, "微信客户沟通总结工具 安装向导")
     exe = os.path.join(wiz_dist, f"{WIZARD_BUILD_NAME}.app", "Contents", "MacOS", WIZARD_BUILD_NAME)
     if not _verify_entry(exe, "installer_macos"):
         print("[警告] 安装向导 .app 入口脚本校验异常，请清理构建缓存后重试。", file=sys.stderr)
@@ -177,6 +210,8 @@ def _append_payload() -> None:
         f.write(head)
         f.write(MARKER)
         f.write(encoded)
+    # 追加 payload 后必须重签名（Mach-O 已变化）
+    _codesign(wiz_app)
     # 重命名向导 .app
     final = os.path.join(OUT_DIR, WIZARD_FINAL_NAME)
     if os.path.isdir(final):
