@@ -202,13 +202,14 @@ wxcsm 的 GUI 与引擎（`app.py` / `cli.py` / `core/`）本身是跨平台的�
 
 > Windows 端只能产出 Windows 的 `.exe` / `.app` 安装包；macOS 的 `.app` 必须在 macOS 上用 PyInstaller 生成，本机（Windows）无法直接编译。
 
-前置：macOS 11+，本机 Python 3.11+（系统自带 tkinter；或 `brew install python-tk`），并 `pip install pyinstaller`。
+前置：macOS 11+，本机 Python 3.9+（系统自带 tkinter；brew 版需 `brew install python-tk`），并 `pip install pyinstaller`。
 
-1. 把 macOS 版 WeChatDataAnalysis 安装包（`.dmg` / `.pkg` / `.zip`）放到：
+1. 把 macOS 版 WeChatDataAnalysis 安装包放到：
    ```
    wxcsm/tools/wechatdataanalysis/
    ```
-   （不放也能构建，但安装后的工具点「启动 WeChatDataAnalysis」会提示缺安装包，需你另行下载再放此目录重构建。）
+   **文件名必须以 `WeChatDataAnalysis` 开头**，扩展名 `.dmg` / `.pkg` / `.zip` 之一（launcher 通配 `WeChatDataAnalysis*.dmg/.pkg/.zip` 才能识别），例如 `WeChatDataAnalysis_2.3.0_macOS_arm64.dmg`。文件名不符会导致「已内嵌却找不到」。
+   （不放也能构建，但安装后的工具点「启动 WeChatDataAnalysis」会提示缺安装包，需另下载后放此目录重构建。）
 2. 在 wxcsm 目录、已激活的 venv 下运行：
    ```bash
    python make_macos.py            # 全量：内嵌 WDA 安装包
