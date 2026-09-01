@@ -1,16 +1,18 @@
 """wxcsm macOS 安装向导（自包含，无需外部安装器）。
 
-本文件被 PyInstaller 打成「安装向导」.app，运行时从自身可执行文件尾部读取内嵌的 payload
-（zip：启动工具.app + tools/wechatdataanalysis/<WDA 安装包>），让用户选择安装目录、
-是否创建桌面替身，然后解压 .app 并建替身。
+本文件被 PyInstaller 打成「安装向导」.app，运行时从 Contents/Resources/wxcsm_payload.bin
+读取内嵌的 payload（zip：启动工具.app + tools/wechatdataanalysis/<WDA 安装包>），让用户选择
+安装目录、是否创建桌面替身，然后解压 .app 并建替身。
 
 分发形态（macOS 习惯）：
   - 本向导 .app 双击即运行（无需管理员，默认装到 ~/Applications）。
   - 真正业务程序是 payload 里的「启动工具.app」，安装后用户双击它或用桌面替身启动。
   - WeChatDataAnalysis 安装包一并内嵌，由「启动工具.app」里的按钮负责拉起/打开安装。
 
-payload 以固定标记 `WXCSM_PAYLOAD_V2\n` 开头紧跟 XOR(0xAA) 编码的 zip，拼接在 Mach-O 可执行尾部。
-（XOR 是为了防止内嵌 启动工具.app 尾部的 PyInstaller CArchive cookie 被本向导 bootloader 误识别。）
+payload 以独立文件 `Contents/Resources/wxcsm_payload.bin` 形式放置，内容是 XOR(0xAA) 编码的 zip。
+（放在 Resources 而非拼到 Mach-O 可执行尾部，是为了不破坏向导 .app 的 ad-hoc codesign，
+ 否则他人 Mac 会因「签名严格校验失败」硬拒打开。XOR 仍用于防止内嵌 启动工具.app 尾部的
+ PyInstaller CArchive cookie 被本向导 bootloader 误识别。）
 """
 from __future__ import annotations
 
@@ -24,7 +26,7 @@ import tkinter.messagebox as mb
 import tkinter.filedialog as fd
 import zipfile
 
-PAYLOAD_MARKER = b"WXCSM_PAYLOAD_V2\n"
+PAYLOAD_BIN = "wxcsm_payload.bin"
 PAYLOAD_XOR_KEY = 0xAA
 APP_BUNDLE = "启动工具.app"
 APP_NAME = "微信客户沟通总结工具"
@@ -32,17 +34,26 @@ APP_NAME = "微信客户沟通总结工具"
 DEFAULT_DIR = os.path.expanduser("~/Applications")
 
 
+def _find_payload() -> str:
+    """定位内嵌 payload 文件（frozen .app 内 Contents/Resources/wxcsm_payload.bin）。"""
+    # frozen：sys.executable 是 .app/Contents/MacOS/<name>，Resources 在同级目录
+    candidate = os.path.normpath(
+        os.path.join(os.path.dirname(sys.executable), "..", "Resources", PAYLOAD_BIN)
+    )
+    if os.path.isfile(candidate):
+        return candidate
+    # 开发态回退：脚本同目录
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), PAYLOAD_BIN)
+    if os.path.isfile(here):
+        return here
+    raise RuntimeError("未找到内嵌安装数据 wxcsm_payload.bin"
+                       "（这不是通过 make_macos 生成的安装包）。")
+
+
 def _read_payload_zip() -> "zipfile.ZipFile":
-    with open(sys.executable, "rb") as f:
-        data = f.read()
-    i = data.rfind(PAYLOAD_MARKER)
-    if i < 0:
-        i = data.rfind(b"WXCSM_PAYLOAD_V1\n")
-        if i < 0:
-            raise RuntimeError("未找到内嵌安装数据（这不是通过 make_macos 生成的安装包）。")
-        raw = data[i + len(b"WXCSM_PAYLOAD_V1\n"):]
-    else:
-        raw = bytes(b ^ PAYLOAD_XOR_KEY for b in data[i + len(PAYLOAD_MARKER):])
+    path = _find_payload()
+    with open(path, "rb") as f:
+        raw = bytes(b ^ PAYLOAD_XOR_KEY for b in f.read())
     return zipfile.ZipFile(io.BytesIO(raw))
 
 
