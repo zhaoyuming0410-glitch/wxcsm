@@ -150,6 +150,7 @@ wxcsm/
 ├── .github/workflows/build-macos.yml   GitHub Actions 自动构建 macOS 包
 ├── push_via_api.py       受限网络下用 API 上传仓库（替代 git push）
 ├── wait_download.py      监控构建并下载/校验 artifact（开发辅助）
+├── make_release.py       把产物发布为 GitHub Release（开发辅助）
 └── core/
     ├── models.py         数据模型
     ├── pipeline.py       业务流水线（GUI 与 CLI 共用）
