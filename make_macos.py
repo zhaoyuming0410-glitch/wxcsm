@@ -31,6 +31,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import urllib.request
 import zipfile
 
@@ -82,6 +83,32 @@ def _wda_installer_files() -> list:
         if os.path.isfile(p) and fn.lower().endswith((".dmg", ".pkg", ".zip")):
             out.append(p)
     return out
+
+
+def _normalize_wda_names() -> None:
+    """保证内嵌的 WDA 包能被运行时找到。
+
+    打包端 `_wda_installer_files()` 会接受 tools/wechatdataanalysis/ 下任意
+    .dmg/.pkg/.zip，但运行时 wda_launcher.find_installer() 只 glob
+    `WeChatDataAnalysis*.{dmg,pkg,zip}`（core/wda_launcher.py 第 28 行）。
+    两者不一致会导致「包已内嵌、运行时却提示缺安装包」——430MB 白做。
+
+    故构建前把不匹配前缀的文件重命名为 `WeChatDataAnalysis-<原名>`。
+    """
+    prefix = "WeChatDataAnalysis"
+    for p in _wda_installer_files():
+        fn = os.path.basename(p)
+        if fn.startswith(prefix):
+            continue
+        new_fn = f"{prefix}-{fn}"
+        new_p = os.path.join(WDA_DIR, new_fn)
+        # 同名已存在则先让位，避免覆盖用户文件
+        if os.path.exists(new_p):
+            new_p = os.path.join(WDA_DIR, f"{prefix}-{int(time.time())}-{fn}")
+            new_fn = os.path.basename(new_p)
+        os.rename(p, new_p)
+        print(f"[修正] WDA 安装包重命名以匹配运行时查找规则：\n"
+              f"       {fn}\n    -> {new_fn}")
 
 
 def _download_wda(url: str) -> None:
@@ -284,11 +311,16 @@ def main() -> int:
     else:
         include_wda = "--no-wda" not in sys.argv
     if include_wda:
-        n = len(_wda_installer_files())
-        if n == 0:
+        _normalize_wda_names()   # 改名以匹配运行时 find_installer() 的 glob
+        files = _wda_installer_files()
+        if not files:
             print(f"[提示] tools/wechatdataanalysis/ 下未找到 macOS 版 WDA 安装包"
                   f"（.dmg/.pkg/.zip），将构建【不含 WDA】的版本。\n"
                   f"       如需内嵌，请先放入 macOS 版 WeChatDataAnalysis 安装包后重试。")
+        else:
+            for p in files:
+                print(f"[WDA] 将内嵌：{os.path.basename(p)} "
+                      f"({os.path.getsize(p)/1024/1024:.1f} MB)")
     _build_real_app(include_wda)
     _build_wizard()
     _write_payload()
