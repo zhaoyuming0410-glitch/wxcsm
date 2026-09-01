@@ -7,10 +7,10 @@
      启动工具.app/Contents/Resources/wechatdataanalysis/（wda_launcher 会自动找到）。
   2) 注入「卸载.command」到 启动工具.app 顶层（双击即可卸载）。
   3) PyInstaller 把 installer_macos.py 打成安装向导 .app（--windowed）。
-  4) 把 启动工具.app 递归打成 payload.zip（ZIP_STORED），XOR(0xAA) 后追加到
-     安装向导 .app 的 Mach-O 可执行尾部（标记 WXCSM_PAYLOAD_V2）。
-     —— XOR 防止内嵌 启动工具.app 尾部的 PyInstaller CArchive cookie 被向导
-        bootloader 误识别（同 Windows 版原理）。
+  4) 把 启动工具.app 递归打成 payload.zip（ZIP_STORED），XOR(0xAA) 后写入
+     安装向导 .app 的 Contents/Resources/wxcsm_payload.bin（独立文件，不碰 Mach-O）。
+     —— 放在 Resources 而非拼到可执行尾部，是为了不破坏向导 .app 的 ad-hoc codesign，
+        否则他人 Mac 会因「签名严格校验失败」硬拒打开（同 Windows 版用 XOR 防 cookie 误识别）。
   5) 重命名安装向导 .app 为「微信客户沟通总结工具安装向导.app」。
   6)（可选 --dmg）hdiutil 打成 .dmg 便于分发。
 
@@ -39,7 +39,6 @@ if sys.platform != "darwin":
 HERE = os.path.dirname(os.path.abspath(__file__))
 WDA_DIR = os.path.join(HERE, "tools", "wechatdataanalysis")
 OUT_DIR = os.path.join(HERE, "dist_installer")
-MARKER = b"WXCSM_PAYLOAD_V2\n"
 XOR = 0xAA
 
 REAL_APP_NAME = "启动工具.app"          # payload 内条目前缀 & 业务 .app 名
@@ -106,13 +105,20 @@ def _patch_display(app_path: str, display_name: str) -> None:
 
 
 def _codesign(app_path: str) -> None:
-    """对 .app 做 ad-hoc 重签名，避免修改 Info.plist / 追加 payload 后签名失效。"""
+    """对 .app 做 ad-hoc 重签名；若失败则清掉签名，避免「无效签名」被硬拒。"""
     try:
         subprocess.run(["codesign", "--force", "--deep", "--sign", "-", app_path],
                        cwd=HERE, check=True)
         print("      codesign (ad-hoc) 完成")
     except Exception as e:
-        print(f"[警告] codesign 失败，未签名 app 在他人 Mac 上需先放行：{e}", file=sys.stderr)
+        print(f"[警告] codesign 失败：{e}", file=sys.stderr)
+        # 失败时不要留「无效签名」状态：清掉签名，至少能靠用户手动放行打开
+        try:
+            subprocess.run(["codesign", "--remove-signature", app_path],
+                           cwd=HERE, check=True)
+            print("      已移除签名（他人 Mac 需手动放行后打开）。", file=sys.stderr)
+        except Exception:
+            pass
 
 
 def _verify_entry(exe_path: str, script_name: str) -> bool:
@@ -175,7 +181,7 @@ def _build_wizard() -> None:
            "--specpath", OUT_DIR]
     _run(cmd)
     wiz_app = os.path.join(wiz_dist, f"{WIZARD_BUILD_NAME}.app")
-    # 设置 Finder 中文显示名（此时 payload 尚未追加，先改 plist；签名在追加后统一做）
+    # 设置 Finder 中文显示名（此时 payload 尚未写入，先改 plist；签名在写 payload 后统一做）
     _patch_display(wiz_app, "微信客户沟通总结工具 安装向导")
     exe = os.path.join(wiz_dist, f"{WIZARD_BUILD_NAME}.app", "Contents", "MacOS", WIZARD_BUILD_NAME)
     if not _verify_entry(exe, "installer_macos"):
@@ -198,19 +204,17 @@ def _pack_payload() -> bytes:
     return data
 
 
-def _append_payload() -> None:
+def _write_payload() -> None:
     payload = _pack_payload()
     wiz_app = os.path.join(OUT_DIR, "wxcsm_wizard", f"{WIZARD_BUILD_NAME}.app")
-    exe = os.path.join(wiz_app, "Contents", "MacOS", WIZARD_BUILD_NAME)
-    print("[4/4] 拼接 payload 到安装向导可执行尾部…")
-    with open(exe, "rb") as f:
-        head = f.read()
+    res_dir = os.path.join(wiz_app, "Contents", "Resources")
+    os.makedirs(res_dir, exist_ok=True)
+    bin_path = os.path.join(res_dir, "wxcsm_payload.bin")
+    print("[4/4] 写入 payload 到 Contents/Resources/wxcsm_payload.bin …")
     encoded = bytes(b ^ XOR for b in payload)
-    with open(exe, "wb") as f:
-        f.write(head)
-        f.write(MARKER)
+    with open(bin_path, "wb") as f:
         f.write(encoded)
-    # 追加 payload 后必须重签名（Mach-O 已变化）
+    # Mach-O 未被改动（payload 在 Resources），做一次 ad-hoc 重签名保证一致
     _codesign(wiz_app)
     # 重命名向导 .app
     final = os.path.join(OUT_DIR, WIZARD_FINAL_NAME)
@@ -244,7 +248,7 @@ def main() -> int:
                   f"       如需内嵌，请先放入 macOS 版 WeChatDataAnalysis 安装包后重试。")
     _build_real_app(include_wda)
     _build_wizard()
-    _append_payload()
+    _write_payload()
     if make_dmg:
         _make_dmg()
     return 0
