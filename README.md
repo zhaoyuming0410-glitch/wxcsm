@@ -228,6 +228,19 @@ wxcsm 的 GUI 与引擎（`app.py` / `cli.py` / `core/`）本身是跨平台的�
 - **CI 产出的是「不含 WDA」的精简版**：`tools/` 被 `.gitignore` 忽略，WeChatDataAnalysis 安装包体积大、不适合进 git。需要内嵌 WDA 的全量版，请在自己 Mac 上放好包后本地 `python make_macos.py`（见上）。
 - **下载**：Actions 页 → 对应 run → Artifacts → 下载 `wxcsm-macos.zip`（内含 `微信客户沟通总结工具安装向导.app` 与 `.dmg`）。在 Mac 上双击 `.app` 即安装向导；或挂`载`.dmg 拖拽到 `Applications`。
 - 工作流需要能写 `.github/workflows/` 的 token 权限（classic PAT 需勾选 `workflow` 作用域）。
+- **CI 偶发「预执行期失败」**：表现为 run 几秒内结束、`steps=0`、日志 zip 为空（22 字节）。这是 GitHub 托管 macOS runner 调度不到机器，与本项目代码无关，**不要为此改代码**。已知排查结论：workflow YAML 合法、代码可编译、macOS 分钟数未用尽。等其自行恢复后重试即可。
+
+### 分发：该发哪个包？
+
+| 包 | 大小 | 适用 |
+|---|---|---|
+| **完整安装包** | 435 MB | 对方**没装过** WeChatDataAnalysis |
+| **精简版** | 11.6 MB | 对方**已装过** WeChatDataAnalysis |
+
+- **完整安装包**含两个 dmg，收件人必须**按顺序**安装：① `WeChatDataAnalysis-2.3.0-mac-arm64.dmg` → ② `微信客户沟通总结工具安装向导.dmg`。顺序反了首次使用会读不到聊天记录（wxcsm 只读取、不自带解密能力）。
+- **精简版**只含 wxcsm 安装向导。省掉 423MB 的依据：`core/wda_launcher.py` 会自动探测 `/Applications/WeChatDataAnalysis.app` 与 `~/Applications/WeChatDataAnalysis.app`，已装即自动拉起。
+- **分发优先发 `.dmg`，不要打包 `.app` 目录**：`.app` 内部含 Unix 可执行位与符号链接，从 Windows 打包/解压会丢失这些信息，Mac 上很可能打不开；`.dmg` 作为磁盘镜像能完整保留权限结构。
+- **硬件要求**：Apple 芯片（M1/M2/M3 等）。WeChatDataAnalysis 的 macOS 版目前只提供 arm64 版本，Intel Mac 无法使用。
 
 ### 备注
 
