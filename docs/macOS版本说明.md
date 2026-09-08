@@ -14,9 +14,9 @@
 | **读取已解密数据库** | ✅ | 跨平台 |
 | 本地总结 / AI 总结 | ✅ | 走 HTTP |
 | Excel 导出 | ✅ | openpyxl |
-| **直接读取本机微信（wx4）** | ❌ | 该数据源为 **Windows 微信 4.x** 专属（依赖 winreg / DPAPI / 进程内存扫描）。macOS 微信是另一套 App，数据路径/加密完全不同，无法复用这套机制。macOS 上该数据源不会生效。 |
+| **直接读取本机微信（wx4mac）** | 🟡 尽力实现 | macOS 版新增 `core/mac_wx4/`：Mach VM 内存扫钥 + SQLCipher4 页解密 + mac 目录定位；GUI 在 mac 上会显示「直接读取本机微信（macOS 4.x）」。**需真机验证**，且需先 `sudo` 重签微信去掉 Hardened Runtime（系统级一次性操作）。详见 `docs/macOS微信直读_真机步骤.md`。 |
 
-**macOS 微信数据直读**：本仓库不承诺支持。现代 macOS 微信数据库多加密、结构随版本变动，需在装有微信的 Mac 上另行逆向验证（见 `core/sources/mac_wx.py`，仅供命令行探测历史明文库）。实际取数建议用「导入文件 / 已解密库」数据源。
+**关于「直接读取本机微信」**：Windows 版 `wx4` 数据源依赖 Windows 专属机制（winreg/DPAPI/ReadProcessMemory/Weixin.dll），macOS 无法复用。为此新增 macOS 版 **`wx4mac`** 数据源（`core/mac_wx4/`），按公开资料实现 macOS 微信 4.x 的取钥+解密。**当前为“尽力实现 + 需真机验证”状态**——在装有微信 4.x 的 Mac 上按 `docs/macOS微信直读_真机步骤.md` 跑通后即为正式可用；验证完成前，实际取数仍建议用「导入文件 / 已解密库」数据源。
 
 ## 二、在 Mac 上运行（开发调试）
 
@@ -48,5 +48,7 @@ python3 make_macos.py --dmg      # 额外打 .dmg 便于拖拽安装
 
 ## 五、已知边界
 
-- 不内嵌、不依赖任何第三方工具；wx4 仅 Windows。
-- macOS 微信直读未真机验证；数据源下拉里该选项在 macOS 不工作，请用其余三种。
+- 不内嵌、不依赖任何第三方工具。
+- Windows 版 `wx4` 仅 Windows；macOS 版 `wx4mac` 仅 macOS（Mach VM + Hardened Runtime 重签）。
+- macOS 微信直读（`wx4mac`）为**尽力实现、未真机验证**：需在装有微信 4.x 的 Mac 上按
+  `docs/macOS微信直读_真机步骤.md` 跑通；验证完成前该数据源可能不可用，请用其余数据源。

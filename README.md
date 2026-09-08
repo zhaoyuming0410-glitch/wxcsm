@@ -185,7 +185,9 @@ wxcsm/
         ├── base.py       适配器接口
         ├── demo.py       内置样例
         ├── importer.py   文件导入（支持 .zip 自动解压）
-        └── sqlite_db.py  已解密数据库（只读，支持 .zip 自动解压）
+        ├── sqlite_db.py  已解密数据库（只读，支持 .zip 自动解压）
+        └── mac_wx4.py     macOS 微信直读适配器（见 core/mac_wx4/）
+    ├── mac_wx4/          macOS 微信直读引擎（Mach VM 扫钥+解密；尽力实现，需真机验证）
 ```
 
 想接企业微信会话存档、飞书或其他渠道？继承 `core/sources/base.py` 里的 `ChatSource`，
