@@ -87,13 +87,20 @@ def _infer_stage(text: str) -> str:
     return best
 
 DEMAND_HINTS = ("希望", "想", "能不能", "能否", "可以吗", "需要", "要求", "建议", "麻烦",
-                "有没有办法", "怎么", "如何", "什么时候", "诉求", "期望", "最好")
+                "有没有办法", "怎么", "如何", "什么时候", "诉求", "期望", "最好",
+                "协助", "帮忙", "烦请", "请你", "麻烦你")
 ISSUE_HINTS = ("报错", "错误", "失败", "卡住", "不行", "异常", "找不到", "很慢",
                "问题", "投诉", "不太顺", "用不了", "空的", "没有匹配", "推不动", "出错",
-               "被驳回", "对不上", "差了", "超标", "不够", "不匹配")
+               "被驳回", "对不上", "差了", "超标", "不够", "不匹配",
+               # 补强: 让"无法上传发票/无发票无法提交/定不了酒店/没有对应取消界面"等要点被识别
+               "无法", "不能", "定不了", "没有对应", "不可用", "不完整", "没通过",
+               "无票", "没结束", "申请不了", "上传不了", "调不了")
 PROGRESS_HINTS = ("已", "完成", "配好", "配置完成", "上线", "生效", "通过", "解决", "发您",
                   "发你", "提交", "确认", "安排", "预计", "下周", "明天", "今天下午",
-                  "工作日", "同步给", "拉您", "跟进", "待", "计划")
+                  "工作日", "同步给", "拉您", "跟进", "待", "计划",
+                  # 补强: 我方指导/说明类动作( 保存/取消/去掉/重新/就行/即可/修改/说明 )
+                  "就行", "即可", "保存", "取消", "去掉", "重新", "修改", "说明",
+                  "可以", "不需要", "即可提交")
 NOISE = re.compile(r"^(好的|收到|谢谢|感谢|嗯+|ok|OK|在吗|你好|早上好|哈哈+|[。，！？.!?]*)$")
 SENT_SPLIT = re.compile(r"[。！？；\n]+")
 
@@ -130,8 +137,96 @@ _SECOND = re.compile(r"[您你你们你方]")
 # 口语填充词：出现在小句开头时整句偏闲扯，去掉后留下的才是事实
 _FILLER_LEAD = re.compile(r"^(另外|还有|以及|同时|然后|其实|那个|这个)")
 _FILLER_TRAIL = re.compile(r"(也想一起上|也想|也一起上|一起上|呀|啊|呢|吧|哦|噻|哈)$")
+# 转折/承接连词：切小句后可能残留"但/但是/因为"等开头词，去掉避免句子从连词起跳
+_CONJ_LEAD = re.compile(r"^(但|但是|不过|然而|所以|因此|因而|因为|于是|就是说|也就)")
+# 引述动词(说/提到/反馈说等)常把客户/系统原话引进来，总结里应去掉只剩事实本体：
+# 「审批说没有匹配的审批人」→「没有匹配的审批人」
+_QUOTE_LEAD = re.compile(r"^(说是|说|反馈说|反馈|提到|提及|讲是|讲|说的是|称)");
+# 开头指示代词/话语标记( 这种/这个/该/这笔/目前/现在 ), 去掉后事实更直接:
+# 「这种提供信息不完整是费用归属没有选」→「提供信息不完整是费用归属没有选」
+_DEMON_LEAD = re.compile(r"^(这种|这个|该|此|这笔|这笔单|该订单|这个单|目前|现在|就是说|我这个)")
+# 判断句系动词开头( 是/这是/就是/是走/是到 ), 去掉后是事实本体:
+# 「这笔是走纯报销」→(去"这笔")「是走纯报销」→「走纯报销」
+_BE_LEAD = re.compile(r"^(这是|就是|是走|是到|是那|是这|是)")
 # 纯客套/应答句（兜底抽取时用来跳过，不进总结）
 _PLEASANTRY = re.compile(r"^(嗯+|哦+|好的|好|行|那|额|哎|哈哈+|OK|ok)")
+# 脏字/情绪化口语：出现即丢弃小句, 避免把客户情绪原样带进归档总结
+_CRUDE = re.compile(r"[艹草卧槽我靠妈蛋尼玛操靠]")
+# 微信表情占位(方括号包起来的中文表情名, 如 [捂脸]/[微笑]/[旺柴])
+_EMOTICON = re.compile(r"\[[^\]]{1,8}\]")
+# 群聊里的 @提及占位(如 @张凯、@王影王老师), 对句式衔接是噪音, 直接去掉
+# 匹配 @ 后不含空白/全角空格/标点的一段,避免 "@仇娱 Cynthia 仇老师" 只剩人名残留
+_AT_MENTION = re.compile(r"@[^\s\u3000，。；：、,;:]{1,24}")
+# emoji 与扩展符号(含代理对、变体选择符、旗帜等)
+_EMOJI = re.compile(
+    r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u2190-\u21FF\u2300-\u23FF]"
+    r"|[\U0001F1E6-\U0001F1FF]"
+)
+
+# 问题反例：句子表达"没问题 / 已解决 / 正常"等正面或已闭环结论时，不能判成待处理问题。
+# 例：客户说「采购流没问题」——含"问题"二字但其实是肯定句，若照 ISSUE_HINTS 命中会被误报。
+_ISSUE_OKAY = re.compile(
+    r"没(问题|毛病|异常|毛病|卡)|不卡|(能|可)以|已解决|解决好了|通过了|验证通过|"
+    r"恢复正常|搞定了|没问题|没毛病|都正常|走通了|测试通过"
+)
+
+# 诉求补充：客户直接"让/麻烦/帮忙 + 我方做某事"的命令式请求(没有 希望/想 这类引导词)，
+# 应归为「需求」而非「问题」。例:「把电子发票查验讲细一点」「帮忙配一下」。
+_DEMAND_IMP = re.compile(r"(麻烦|帮我|帮我方|帮我们|帮忙|协助|烦请|请(帮|协助|处理)?|给(我们|我方)?配|把.{0,20}?(做|讲|配|调|加|减|开|关|改|处理)|安排一下|出一份|再给我|发我(一|一份)?|给我们)")
+
+# 空壳句：只含问法/请求引导词、没有实际内容主体的碎片(如"有什么办法""怎么办""想了解一下")。
+# _clean_fact 切小句后可能留下这类空壳，若放进需求/问题会产出「存在有什么办法等情况」这种废句。
+_QUESTION_SHELL = re.compile(
+    r"^(有什么|有什么办法|怎么办|怎么做|怎么|如何|想了解|想请教|想问|"
+    r"行不行|可不可以|能不能|可以吗|有没有|还有没|那怎么)"
+)
+
+# 请求句尾的空动作填充词(麻烦/请 帮我看一下/修改一下/处理一下 等)，去掉后才是诉求本体。
+# 例:「过路费发票这个麻烦也修改看一下」→「过路费发票这个也修改」
+_TAIL_ACTION = re.compile(r"(麻烦|请)?(帮|帮忙)?(也|都|还|再)?(看下|看一下|看|改一下|修改一下|处理一下|调整一下|弄一下|确认一下|查一下|帮我看下|帮忙看下|看一下问题)$")
+# 冗余强调填充词( 也必须/也必须要/需要必须/必须必须 ), 去掉让句子更平顺
+_REDUNDANT_FILLER = re.compile(r"(也?(需要|得|必须要?)必须|必须必须|都必须要|也必须要)")
+
+# ---- 消息级噪音(在抽取前剥离,否则会把系统占位/发送人标签捕进总结) ----
+# 微信"引用/系统类型"占位,如 [类型244813135921]、[图片]、[视频]、[文件]
+_SYS_PLACEHOLDER = re.compile(r"\[[^\]]{0,40}\]")
+# 消息文本里带的发送人标签,如 "wxid_xxx: 内容"、"cherish_0823: 内容" 前缀
+_SENDER_TAG = re.compile(
+    r"^(?:wxid_[A-Za-z0-9_-]+|[A-Za-z0-9_\u4e00-\u9fff]{1,24}):\s*")
+# XML/HTML 标签(含引号/换行/未闭合,如 <img a="…">、<?xml…?>、<msg>…</msg>、<soun…)
+_XML_TAG = re.compile(r"<[^>\n]*>", re.S)
+# 仅剩 XML 开头(无闭合 `>` 的残缺标签,如 <soun、<appmsg) 及 <… 开头残留
+_XML_BROKEN = re.compile(r"^<[A-Za-z][^\s]*")
+# 文件/音频/图片等附件名残留(如 飞书20260902-141958.qt、1789467209)
+_FILE_STUB = re.compile(r"[A-Za-z0-9_\u4e00-\u9fff]{6,}\.(qt|docx?|pdf|xlsx?|pptx?|mp4|mov|png|jpg|jpeg|amr|silk)$")
+_LONG_ID = re.compile(r"^\d{6,}$")
+
+
+def _strip_message_noise(text: str) -> str:
+    """去掉抽取前的消息噪音: 发送人标签、XML/占位、@提及、系统占位、附件名/长ID。
+
+    微信把 图片/视频/文件/引用 都以 [类型xxx] 或 <msg>…</msg> 或 <img …> 内嵌在文本里,
+    若不清掉, 总结会出现「[类型244813135921]」「<img …>」这类无效 token。
+    清洗后若只剩 XML/媒体残渣或无业务文字, 返回空串由上层丢弃。
+    """
+    text = _SENDER_TAG.sub("", text)
+    # 去 XML 标签与 CDATA,再补删未闭合的残缺标签
+    text = _XML_TAG.sub("", text)
+    text = re.sub(r"<!\[CDATA\[.*?\]\]>", "", text, flags=re.S)
+    text = re.sub(r"<\?[^>]*\?>", "", text, flags=re.S)
+    text = _XML_BROKEN.sub("", text)
+    text = _AT_MENTION.sub("", text)
+    text = _EMOTICON.sub("", text)
+    text = _EMOJI.sub("", text)
+    text = _SYS_PLACEHOLDER.sub("", text)
+    text = _FILE_STUB.sub("", text)
+    text = _LONG_ID.sub("", text)
+    text = text.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    text = text.strip("，。；、： \t\n")
+    # 若清洗后仍以 XML/媒体标记开头, 判为纯媒体无业务文字, 交由上层丢弃
+    if not text or re.match(r"^\s*<", text):
+        return ""
+    return text
 
 
 def _clean_fact(text: str, strip_hints: bool = False) -> str:
@@ -149,10 +244,32 @@ def _clean_fact(text: str, strip_hints: bool = False) -> str:
         c = c.strip()
         if not c or len(c) < 4 or _SECOND.search(c) or _PLEASANTRY.match(c):
             continue
+        # 过滤脏字/情绪化口语(如「艹」)与无信息量感叹词, 让总结更客观专业。
+        if _CRUDE.search(c):
+            continue
         if strip_hints:
             c = _HINT_LEAD.sub("", c)
         c = _FILLER_LEAD.sub("", c)
         c = _FILLER_TRAIL.sub("", c)
+        # 去小句开头残留的转折/承接连词与引述动词(说/提到/反馈说)
+        c = _CONJ_LEAD.sub("", c)
+        c = _QUOTE_LEAD.sub("", c)
+        # 去开头指示代词/话语标记(这种/这个/该/这笔/目前), 让事实更直接
+        c = _DEMON_LEAD.sub("", c)
+        # 去判断句系动词开头(是/这是), 但若去掉后只剩孤立动词/太短则保留原样
+        _stripped = _BE_LEAD.sub("", c)
+        if len(_stripped) >= 4:
+            c = _stripped
+        # 去请求句尾的空动作填充词( 麻烦帮忙看一下/修改一下 等)
+        if _TAIL_ACTION.search(c):
+            c = _TAIL_ACTION.sub("", c)
+        # 去冗余强调填充词( 也必须/必须必须 )
+        c = _REDUNDANT_FILLER.sub("", c)
+        # 去掉@提及(如 @王影王老师)与微信表情/emoji 占位(如 [捂脸]、😃)与零宽字符
+        c = _AT_MENTION.sub("", c)
+        c = _EMOTICON.sub("", c)
+        c = _EMOJI.sub("", c)
+        c = c.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
         c = c.strip("，。；、 ")
         if c:
             out.append(c)
@@ -178,7 +295,21 @@ def enforce_length(text: str, min_chars: int, max_chars: int) -> Tuple[str, bool
 # =====================================================================
 def summarize_offline(bundle: ChatBundle, min_chars: int = 50, max_chars: int = 200,
                      stage: Optional[str] = None) -> str:
-    msgs = [m for m in bundle.messages if m.text and not NOISE.match(m.text.strip())]
+    # 跳过 图片/视频/语音/表情/名片/位置/文件/系统消息 等非纯文本消息——
+    # 它们的 text 是 XML/占位噪音, 对总结无业务价值, 从源头排除, 避免把 <img…>/[类型xxx] 捕进正文。
+    _MEDIA_TYPES = {"图片", "视频", "语音", "表情", "名片", "位置",
+                    "文件/链接", "系统消息", "image", "video", "voice", "file"}
+    # 先剥离消息噪音(发送人标签/XML/系统占位/图片视频占位), 抽取用干净文本。
+    _msgs = []
+    for m in bundle.messages:
+        if (m.msg_type or "text") in _MEDIA_TYPES:
+            continue
+        clean = _strip_message_noise(m.text or "")
+        if not clean:
+            continue
+        _msgs.append((m.is_self, clean))
+    msgs = [type("_mini", (), {"text": t, "is_self": s})() for (s, t) in _msgs]
+    msgs = [m for m in msgs if m.text and not NOISE.match(m.text.strip())]
     if not msgs:
         return ("无有效沟通记录，未产生可归档的客户诉求或对接进展，"
                 "建议主动触达确认客户当前状态与使用情况。")
@@ -202,18 +333,28 @@ def summarize_offline(bundle: ChatBundle, min_chars: int = 50, max_chars: int = 
     # 2) 客户诉求 / 问题：只看客户侧发言，抽取后立即洗成客观事实短语
     cust = [m.text for m in msgs if not m.is_self]
     demands, issues = [], []
+
+    def _want(s: str) -> bool:
+        return any(h in s for h in DEMAND_HINTS) or bool(_DEMAND_IMP.search(s))
+
+    def _real_issue(s: str) -> bool:
+        # 含正面/已闭环结论(如"采购流没问题"、"能提交")时不判为待处理问题
+        if _ISSUE_OKAY.search(s):
+            return False
+        return any(h in s for h in ISSUE_HINTS)
+
     for text in cust:
         for sent in SENT_SPLIT.split(text):
             s = sent.strip()
             if len(s) < 5 or NOISE.match(s):
                 continue
-            if any(h in s for h in DEMAND_HINTS) and len(demands) < 3:
+            if _want(s) and len(demands) < 3:
                 fact = _clean_fact(_clip(s, 46), strip_hints=True)
-                if fact and fact not in demands:
+                if fact and not _QUESTION_SHELL.match(fact) and fact not in demands:
                     demands.append(fact)
-            elif any(h in s for h in ISSUE_HINTS) and len(issues) < 3:
+            elif _real_issue(s) and len(issues) < 3:
                 fact = _clean_fact(_clip(s, 46))
-                if fact and fact not in issues:
+                if fact and not _QUESTION_SHELL.match(fact) and fact not in issues:
                     issues.append(fact)
 
     # 3) 对接进度：看我方发言里的承诺与完成项，优先取最近的
@@ -276,32 +417,50 @@ def summarize_offline(bundle: ChatBundle, min_chars: int = 50, max_chars: int = 
     # 主题顺序：先按热力排序的 topic_list，再补归集中多出来的主题
     ordered_topics = [t for t in topic_list if t in buckets] + [t for t in seen_order if t not in topic_list]
 
-    # 每个主题的句子由若干"段"组成，每段带优先级：进度=1（最高）> 问题=2 > 需求=3（最先砍）。
-    # 这样超长裁剪时先丢需求、再丢问题，永远保住"已做进度"这一段对客户成功归档最关键的复盘信息。
-    topic_segs: Dict[str, List[Tuple[int, str]]] = {}
-    for t in ordered_topics:
-        b = buckets[t]
-        segs: List[Tuple[int, str]] = []
-        if b["progress"]:
-            segs.append((stage_priority["progress"], "，".join(b["progress"])))
-        if b["issue"]:
-            segs.append((stage_priority["issue"], f"存在{'，'.join(b['issue'])}等情况，需进一步排查处理"))
-        if b["demand"]:
-            segs.append((stage_priority["demand"], f"客户提出{'，'.join(b['demand'])}等需求，待排期落实"))
-        topic_segs[t] = segs
+    # ---- 组装为连贯叙述(近似 AI 版行文) ----
+    # 目标: 去掉"XX方面"主题标签与"需进一步排查处理/待落实排期"机械尾巴,
+    # 改为「客户主要围绕X沟通 → 客户反馈/提出… → 我方已… → 后续关注…」的客观叙述,
+    # 与 AI 版一致; 但仍是纯抽取, 只用记录里洗出的短语, 绝不通顺化为编造。
+    def _merge(items):
+        seen = []
+        for it in items:
+            if it and it not in seen:
+                seen.append(it)
+        return seen
+
+    def _render(keep_issue: bool, keep_demand: bool) -> str:
+        lead_topic = "、".join(topic_list or ordered_topics) or "日常使用与服务对接"
+        prog = _merge(progress)
+        cust_issue = _merge(issues) if keep_issue else []
+        cust_demand = _merge(demands) if keep_demand else []
+
+        # 抽取的短语是零散事实片段, 用"；"并列最安全——硬用"并/且"连起来反而会出现
+        # "并是走纯报销"这类错乱。这里只负责合理分组, 不擅自做语义衔接。
+        seg = f"客户主要围绕{lead_topic}与我方沟通"
+        segs = []
+        if cust_issue:
+            segs.append("客户反馈" + "；".join(cust_issue))
+        if cust_demand:
+            segs.append("客户提出" + "；".join(cust_demand))
+        if segs:
+            seg += "，" + "；".join(segs)
+        if prog:
+            import re as _re
+            any_done = any(_re.search(r"(已|可以|能|可|完成|通过|生效|上线|配好|解决|搞好|到位)", p)
+                           for p in prog)
+            seg += "，" + ("我方" if any_done else "我方已") + "；".join(prog)
+        return seg + "。"
 
     def _assemble(max_priority: int) -> str:
-        """只保留优先级 <= max_priority 的段（数字越小越重要）。"""
-        parts = []
-        for t in ordered_topics:
-            kept = [s for (p, s) in topic_segs[t] if p <= max_priority]
-            if not kept:
-                continue
-            body = "；".join(kept)
-            parts.append(f"{t}方面，{body}。" if t != "其他事项" else f"{body}。")
-        return "".join(parts)
+        # 优先级: 需求(3)最先砍 > 问题(2) > 进度(1)最保。默认全留(3), 超长逐级丢。
+        keep_demand = max_priority >= 3
+        keep_issue = max_priority >= 2
+        text = _render(keep_issue, keep_demand)
+        if keep_issue and (issues or demands):
+            text = text.rstrip("。") + "。后续建议持续跟进，确认客户使用情况并推动相关事项落地。"
+        return text
 
-    if not any(topic_segs.values()):
+    if not any(buckets.values()):
         text = "沟通以信息同步为主，暂无明确未闭环事项，建议持续关注客户使用状态。"
     else:
         # 进度优先：默认全保留；超长则依次丢弃需求(3)、问题(2)，最后只剩进度(1)
@@ -313,21 +472,21 @@ def summarize_offline(bundle: ChatBundle, min_chars: int = 50, max_chars: int = 
     text, ok = enforce_length(text, min_chars, max_chars)
 
     if not ok and len(re.sub(r"\s", "", text)) < min_chars:
-        # 字数不足：补一句结构化收尾，而不是硬凑字
-        tail = (f"建议后续持续跟进上述事项，确认客户使用状态并推动未闭环需求按期落地。")
+        # 字数不足：补一句收尾。若正文已含跟进收尾, 就不能再补跟进同义句(否则会重复),
+        # 改补一个不重复的"时间/范围/建议"落脚句; 否则补跟进句。
+        has_follow = any(k in text for k in ("建议持续关注", "建议持续跟进", "待落实",
+                                             "推动未闭环", "沉淀标准化打法", "后续可重点"))
+        if has_follow:
+            tail = "相关沟通情况与处理结论详见下方明细。"
+        else:
+            tail = "建议后续持续跟进上述事项，确认客户使用状态并推动未闭环需求按期落地。"
         text, _ = enforce_length(text.rstrip("。") + "。" + tail, min_chars, max_chars)
     else:
-        # 字数已达标，但因优先级裁剪丢掉了部分段落：补一句指向，避免信息无声丢失。
-        # 只提实际被砍的段（需求优先级最低最先砍，问题次之），不凭空捏造。
-        dropped = []
-        if demands and "客户提出" not in text:
-            dropped.append("需求")
-        if issues and "需进一步排查" not in text:
-            dropped.append("问题")
-        if dropped:
-            label = "、".join(dropped)
-            if len(re.sub(r"\s", "", text)) <= max_chars - (len(label) + 10):
-                text = text.rstrip("。") + f"。其余{label}详见下方明细。"
+        # 字数已达标, 但因优先级裁剪丢弃了部分内容(需求>问题最先被砍)。
+        # 若正文没体现客户侧(反馈/提出)却被砍,补一句指向,避免信息无声丢失。
+        if (demands or issues) and "客户" not in text:
+            if len(re.sub(r"\s", "", text)) <= max_chars - 12:
+                text = text.rstrip("。") + "。客户具体诉求与问题详见下方明细。"
     return text
 
 

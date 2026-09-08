@@ -34,6 +34,8 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 from core import config, pipeline
 from core.models import Contact
 from core.sources import ORDER, REGISTRY, SourceError, choices
+from core.wx4 import detect_wechat_env, keyring, memkey
+from core.wx4.errors import KeyNotFoundError, WechatNotRunningError
 
 
 def _emit(payload: Dict, as_json: bool, lines: List[str]) -> None:
@@ -215,6 +217,35 @@ def cmd_gui(args) -> int:
     return 0
 
 
+def cmd_wx4_capture(args) -> int:
+    """抓取微信 4.x 数据库密钥(只读内存扫描)。"""
+    from core.wx4.locate import detect_wechat_env
+    env = detect_wechat_env()
+    acc = env.primary_account
+    if not acc:
+        _emit({"ok": False, "error": "未找到微信 4.x 账号数据目录"},
+              args.json, ["[失败] 未找到微信 4.x 账号数据目录"])
+        return 2
+    cached = keyring.load_key(acc.account)
+    if cached and not args.force:
+        _emit({"ok": True, "note": "密钥已缓存, 跳过抓取", "account": acc.account},
+              args.json, [f"账号 {acc.account} 的密钥已缓存, 跳过抓取"])
+        return 0
+    try:
+        key = memkey.capture_key(acc, progress_cb=lambda s: print(s, flush=True),
+                                 restart=args.restart, timeout=args.timeout)
+        keyring.save_key(acc.account, key,
+                         wechat_version=env.version or "",
+                         wechat_exe=env.exe_path or "")
+        _emit({"ok": True, "account": acc.account, "key": key},
+              args.json, [f"✓ 成功抓取账号 {acc.account} 的密钥"])
+        return 0
+    except (KeyNotFoundError, WechatNotRunningError, Exception) as e:
+        _emit({"ok": False, "error": str(e)},
+              args.json, [f"[失败] {e}"])
+        return 2
+
+
 # ---------------- 参数解析 ----------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -226,7 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_common(sp, need_range: bool = False):
         sp.add_argument("--source", choices=ORDER,
-                        help="数据源：demo / import / wxdb")
+                        help="数据源：demo / import / wxdb / wx4（本机微信 4.x 加密库）")
         sp.add_argument("--path", help="数据路径（import / wxdb 填文件夹或 .zip 压缩包）")
         sp.add_argument("--json", action="store_true", help="以 JSON 输出")
 
@@ -266,6 +297,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("gui", help="启动图形界面")
     sp.set_defaults(func=cmd_gui, json=False)
+
+    sp = sub.add_parser("wx4-capture", help="抓取微信 4.x 数据库密钥（只读内存扫描）")
+    sp.add_argument("--force", action="store_true", help="强制重新抓取（覆盖缓存）")
+    sp.add_argument("--restart", action="store_true",
+                    help="自动重启微信后抓取（需要等待登录）")
+    sp.add_argument("--timeout", type=int, default=240,
+                    help="重启模式下的最大等待秒数（默认 240）")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_wx4_capture)
     return p
 
 

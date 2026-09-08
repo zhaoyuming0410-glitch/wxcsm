@@ -1,10 +1,10 @@
-"""第三方微信提取工具（WeFlow 等）共用的消息解析 helpers。
+"""导入导出文件共用的消息解析 helpers（不依赖任何外部工具）。
 
 两条原则：
-  1) 不读微信进程内存、不解密；本文件只做「已解密的 JSON → 内部 Message 模型」的转换。
+  1) 不读微信进程内存、不解密；本文件只做「已导出的 JSON → 内部 Message 模型」的转换。
   2) 微信 Msg.type 的数字编码（1 文本 / 3 图片 / 34 语音 / 43 视频 / 49 分享 …）
-     在 WeFlow 等第三方工具里一致，所以媒体占位表、类型归类可以共用，
-     避免两个适配器各写一份、久而久之对不齐。
+     在各导出格式里一致，所以媒体占位表、类型归类可以共用，
+     避免多个适配器各写一份、久而久之对不齐。
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def parse_time(raw: Any) -> Optional[datetime]:
     """把各类时间表示解析成 datetime，解析失败返回 None。
 
     兼容：RFC3339（含 Z 后缀）、纯秒级时间戳、纯毫秒级时间戳、多种本地格式。
-    WeFlow 的 createTime 为秒级 Unix 时间戳（parse_time 也兼容 RFC3339 等格式，便于对接其它工具）。
+    createTime 通常为秒级 Unix 时间戳（parse_time 亦兼容 RFC3339 等格式，便于对接多种导出）。
     """
     if not raw:
         return None

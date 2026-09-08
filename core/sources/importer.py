@@ -1,7 +1,7 @@
 """导入型数据源：读取已导出的聊天记录文件（CSV / TXT / JSON）。
 
 这是最稳的一条路——不碰微信进程、不依赖微信版本、企业合规上说得清。
-用户先用留痕 / WeChatMsg 等工具把聊天记录导出成文件，本工具只负责读文件。
+用户把聊天记录导出成文件，本工具只负责读文件（导出途径由用户自行掌握）。
 
 约定：一个文件（或一个子目录）= 一个聊天对象，文件名即客户名称。
 支持格式自动识别：
@@ -25,13 +25,13 @@ from .base import ChatSource, SourceError, resolve_zip_root
 SUFFIXES = {".csv", ".txt", ".json"}
 
 TIME_KEYS = ("strtime", "createtime", "time", "时间", "发送时间", "date", "datetime", "ts")
-# 发送人别名：覆盖常见导出工具（留痕 / WeChatMsg / WeChatDataAnalysis 等）。
+# 发送人别名：覆盖常见导出格式（尽量兼容不同导出的列名约定）。
 # senderDisplayName 优先（人类可读名），其次 senderUsername（wxid）。
 SENDER_KEYS = ("senderdisplayname", "sendername", "sender", "displayname", "nickname",
                "fromusername", "talker", "from", "senderusername", "wxid",
                "remark", "发送人", "发言人", "昵称", "speaker", "name")
 CONTENT_KEYS = ("strcontent", "content", "msg", "message", "内容", "消息", "text", "正文")
-# 我方标记：WeChatDataAnalysis 用 isSent（布尔）；其余工具常见 issender / is_self 等。
+# 我方标记：常见导出格式用 isSent（布尔），其余用 issender / is_self 等。
 SELF_KEYS = ("issent", "issend", "issender", "is_self", "self", "是否本人", "是否自己")
 TYPE_KEYS = ("type", "msgtype", "类型")
 
@@ -93,7 +93,7 @@ def _truthy(v) -> bool:
 class ImportSource(ChatSource):
     key = "import"
     label = "导入已导出的聊天记录文件（推荐 · 稳定合规）"
-    hint = ("支持两种：① 直接选 WeChatDataAnalysis / 留痕 等工具导出的 .zip 压缩包，本工具自动解压并解析；"
+    hint = ("支持两种：① 直接选导出的聊天记录 .zip 压缩包，本工具自动解压并解析；"
             "② 选已解压的文件夹（每个 .csv/.txt/.json 文件对应一个聊天对象，文件名即客户名称）。")
     needs_path = True
     path_kind = "file"
@@ -145,7 +145,7 @@ class ImportSource(ChatSource):
         """返回 [(messages.json 路径, 显示名称), ...]。
 
         兼容两种布局：
-          A. WeChatDataAnalysis 导出：任意深度下 conversations/<id>/messages.json，
+          A. 会话目录导出：任意深度下 conversations/<id>/messages.json，
              会话名在 messages.json 的 conversation.displayName，且会附带 meta.json /
              manifest.json / report.json 等非会话文件（必须忽略）。
              注意 zip 解压后往往多一层 wechat_chat_export_xxx/ 包装目录，所以这里

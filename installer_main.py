@@ -1,16 +1,18 @@
 """wxcsm 安装向导（自包含，无需外部安装器如 Inno/NSIS）。
 
 本文件被 PyInstaller 打成「安装程序」exe，运行时从自身尾部读取内嵌的 payload
-（zip：启动工具.exe + tools/wechatdataanalysis/WeChatDataAnalysis-Setup.exe + 卸载脚本），
-让用户选择安装目录、是否创建桌面快捷方式，然后解压并建快捷方式。
+（zip：启动工具.exe + 卸载脚本），让用户选择安装目录、是否创建桌面快捷方式，
+然后解压并建快捷方式。
 
-payload 以固定标记 `WXCSM_PAYLOAD_V1\n` 开头紧跟 zip，拼接在 exe 之后。
+payload 以固定标记 `WXCSM_PAYLOAD_V2\n` 开头紧跟 zip，拼接在 exe 之后，仅含程序本体。
 """
 from __future__ import annotations
 
 import io
 import os
 import sys
+import tempfile
+import ctypes
 import tkinter as tk
 import tkinter.ttk as ttk
 import tkinter.messagebox as mb
@@ -92,7 +94,7 @@ class Installer(tk.Tk):
         ttk.Checkbutton(fopt, text="创建桌面快捷方式", variable=self.var_desktop).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(fopt, text="创建开始菜单快捷方式", variable=self.var_menu).pack(side="left")
 
-        ttk.Label(self, text=f"所需空间约 {human(self._total)}（含 WeChatDataAnalysis 安装包）。",
+        ttk.Label(self, text=f"所需空间约 {human(self._total)}。",
                   foreground="#6B7280", font=("微软雅黑", 9)
                   ).pack(anchor="w", **pad)
 
@@ -163,41 +165,71 @@ class Installer(tk.Tk):
             self.update()
         self.pb.configure(value=100)
 
+    # ---------------- 快捷方式 ----------------
     def _make_shortcut(self, dest: str, where: str) -> None:
-        try:
-            import winshell  # type: ignore
-        except Exception:
-            winshell = None
+        """where: 'Desktop' | 'StartMenu'。用真实(可能被 OneDrive 重定向的)路径。"""
         target = os.path.join(dest, APP_EXE)
         if where == "Desktop":
-            folder = winshell.desktop() if winshell else os.path.join(os.environ["USERPROFILE"], "Desktop")
+            folder = _shell_folder(0x0010)   # CSIDL_DESKTOPDIRECTORY(真实桌面,含重定向)
         else:
-            folder = winshell.programs() if winshell else os.path.join(os.environ["USERPROFILE"], "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs")
+            folder = _shell_folder(0x0002)   # CSIDL_PROGRAMS(开始菜单程序)
+        if not folder:
+            # 兜底 USERPROFILE
+            folder = os.path.join(os.environ.get("USERPROFILE", "C:\\"), "Desktop") \
+                if where == "Desktop" else os.path.join(
+                    os.environ.get("USERPROFILE", "C:\\"), "AppData", "Roaming",
+                    "Microsoft", "Windows", "Start Menu", "Programs")
+        if not os.path.isdir(folder):
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError:
+                return
         link = os.path.join(folder, f"{APP_NAME}.lnk")
         self._create_lnk(link, target, dest)
 
-    @staticmethod
-    def _create_lnk(link: str, target: str, workdir: str) -> None:
-        # 优先用 pywin32 / winshell，失败则回退 PowerShell 建快捷方式
+    def _create_lnk(self, link: str, target: str, workdir: str) -> None:
+        """创建 .lnk。用临时 .ps1 脚本避免内联命令的引号转义问题(之前 os.system 里
+        双层双引号会让 PowerShell 解析失败,快捷方式被静默丢弃)。路径用单引号包裹。"""
+        ps_body = (
+            "$ws = New-Object -ComObject WScript.Shell\r\n"
+            "$s = $ws.CreateShortcut('{0}')\r\n"
+            "$s.TargetPath = '{1}'\r\n"
+            "$s.WorkingDirectory = '{2}'\r\n"
+            "$s.Description = '{3}'\r\n"
+            "$s.Save()\r\n"
+        ).format(link, target, workdir, APP_NAME)
+        ps_file = os.path.join(tempfile.gettempdir(), "wxcsm_mklnk.ps1")
+        # 必须用 utf-8-sig(带 BOM):ps1 含中文路径,PowerShell 把无 BOM 的 UTF-8
+        # 当 ANSI(GBK) 解码会乱码,导致 CreateShortcut 静默失败、快捷方式不生成。
+        with open(ps_file, "w", encoding="utf-8-sig") as f:
+            f.write(ps_body)
         try:
-            import winshell  # type: ignore
-            from win32com.client import Dispatch  # type: ignore
-            with winshell.shortcut(link) as sc:
-                sc.path = target
-                sc.working_directory = workdir
-                sc.description = APP_NAME
-            return
-        except Exception:
-            pass
-        ps = (
-            f'$ws = New-Object -ComObject WScript.Shell; '
-            f'$s = $ws.CreateShortcut(\"{link}\"); '
-            f'$s.TargetPath = \"{target}\"; '
-            f'$s.WorkingDirectory = \"{workdir}\"; '
-            f'$s.Description = \"{APP_NAME}\"; '
-            f'$s.Save()'
-        )
-        os.system(f'powershell -NoProfile -Command "{ps}"')
+            _ = os.system(
+                'powershell -NoProfile -ExecutionPolicy Bypass -File "{0}"'
+                .format(ps_file))
+        finally:
+            try:
+                os.remove(ps_file)
+            except OSError:
+                pass
+
+
+def _shell_folder(csidl: int) -> str:
+    """取真实 Shell 文件夹路径(支持 OneDrive 桌面重定向)。纯 ctypes,不依赖 pywin32。
+    csidl: CSIDL_DESKTOPDIRECTORY=0x10 | CSIDL_PROGRAMS=0x02 | 等。失败返回 ''。"""
+    try:
+        from ctypes import wintypes as _wt
+        shl = ctypes.windll.shell32
+        buf = ctypes.create_unicode_buffer(260)
+        # SHGetFolderPathW(hwnd, csidl, hToken, dwFlags, pszPath)
+        shl.SHGetFolderPathW.argtypes = [_wt.HWND, ctypes.c_int, _wt.HANDLE,
+                                         _wt.DWORD, _wt.LPWSTR]
+        shl.SHGetFolderPathW.restype = ctypes.c_long
+        if shl.SHGetFolderPathW(None, csidl, None, 0, buf) == 0 and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return ""
 
 
 if __name__ == "__main__":

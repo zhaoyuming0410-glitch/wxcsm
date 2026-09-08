@@ -8,12 +8,13 @@ from .base import ChatSource, SourceError
 from .demo import DemoSource
 from .importer import ImportSource
 from .sqlite_db import DecryptedDbSource
+from .wx4_live import Wx4LiveSource
 
 REGISTRY: Dict[str, Type[ChatSource]] = {
-    cls.key: cls for cls in (DemoSource, ImportSource, DecryptedDbSource)
+    cls.key: cls for cls in (DemoSource, ImportSource, DecryptedDbSource, Wx4LiveSource)
 }
 
-ORDER: List[str] = ["demo", "import", "wxdb"]
+ORDER: List[str] = ["wx4", "demo", "import", "wxdb"]
 
 
 def create(key: str, **options) -> ChatSource:

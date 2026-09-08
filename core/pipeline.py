@@ -74,13 +74,17 @@ class RunResult:
 
 
 # ---------- 主流程 ----------
-def build_source(cfg: Dict[str, Any]) -> ChatSource:
-    return create(cfg.get("source", "demo"), path=cfg.get("source_path", ""),
-                  self_names=cfg.get("self_names") or [])
+def build_source(cfg: Dict[str, Any],
+                 progress_cb: Optional[Callable[[str], None]] = None) -> ChatSource:
+    opts = dict(self_names=cfg.get("self_names") or [])
+    if progress_cb:
+        opts["progress_cb"] = progress_cb
+    return create(cfg.get("source", "demo"), path=cfg.get("source_path", ""), **opts)
 
 
-def load_contacts(cfg: Dict[str, Any]) -> List[Contact]:
-    src = build_source(cfg)
+def load_contacts(cfg: Dict[str, Any],
+                  progress_cb: Optional[Callable[[str], None]] = None) -> List[Contact]:
+    src = build_source(cfg, progress_cb=progress_cb)
     ok, msg = src.health()
     if not ok:
         raise SourceError(msg)
@@ -100,10 +104,11 @@ def run(cfg: Dict[str, Any], contacts: Sequence[Contact], start: date, end: date
     if not contacts:
         raise ValueError("请至少选择一个聊天对象。")
 
-    src = build_source(cfg)
+    total = len(contacts)
+    # 前置步骤(取钥/解密)的进度: 进度条保持 0, 只更新状态栏文字, 避免误示处理已完成
+    src = build_source(cfg, progress_cb=(lambda m: progress(0, total, m)) if progress else None)
     summaries: List[Summary] = []
     skipped: List[str] = []
-    total = len(contacts)
 
     def notify(i: int, text: str) -> None:
         if progress:

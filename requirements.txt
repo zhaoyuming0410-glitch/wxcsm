@@ -1,3 +1,5 @@
 # 运行依赖（tkinter 随 Python 标准库安装，无需单独装）
 openpyxl>=3.1.0
 requests>=2.28.0
+pycryptodome>=3.20.0
+zstandard>=0.22.0
