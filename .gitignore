@@ -24,3 +24,12 @@ _ai_real_test.xlsx
 dist_mac/
 # 崩溃日志（PyInstaller windowed 启动失败时写入 __file__ 旁）
 启动工具崩溃.log
+
+# 开发辅助/CI 脚本(含个人GitHub标识, 不提交)
+monitor_build.py
+push_via_api.py
+wait_download.py
+_privacy_scan.py
+
+# 调试/临时脚本(含本机路径, 不提交)
+/_*.py

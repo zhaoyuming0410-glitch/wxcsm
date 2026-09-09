@@ -184,7 +184,7 @@ def find_data_roots() -> List[Path]:
 class WxAccount:
     """一个微信账号及其数据目录。"""
 
-    account: str                    # 账号标识(如 zym1233212)
+    account: str                    # 账号标识(如 wxid_xxx)
     data_dir: Path                  # <root>/<account>_<suffix>
     db_storage: Path
 

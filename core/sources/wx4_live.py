@@ -307,12 +307,12 @@ class Wx4LiveSource(ChatSource):
             
             acc = self._resolve_account()
             self_rowid = None
-            # Name2Id.user_name 存的是微信发送人 id(如 zym1233212), 而账号目录名可能是
-            # zym1233212_effe 这种带环境后缀。逐候选匹配,避免都查不到导致 is_self 全 False。
+            # Name2Id.user_name 存的是微信发送人 id(如 wxid_xxx), 而账号目录名可能是
+            # wxid_xxx_effe 这种带环境后缀。逐候选匹配,避免都查不到导致 is_self 全 False。
             import re as _re
             acct = acc.account
             candidates = [acct]
-            # "zym1233212_effe" → 去掉 "_xxx"/"-xxx" 后缀得 "zym1233212"
+            # "<账号>_effe" → 去掉 "_xxx"/"-xxx" 后缀得 "<账号>"
             base_name = _re.split(r"[_\-][^_\-]+$", acct)[0]
             if base_name and base_name != acct:
                 candidates.append(base_name)
