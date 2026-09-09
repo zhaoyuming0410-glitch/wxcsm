@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -27,12 +28,16 @@ from typing import Dict, List, Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from datetime import datetime, date
+import webbrowser
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core import config, pipeline, workbuddy_models, wda_launcher
-from core.models import Contact, Summary
+from core import config, pipeline, workbuddy_models
+from core.models import Contact, Summary, KIND_LABEL
 from core.sources import SourceError, choices, REGISTRY
+from core.wx4 import keyring, locate
+from core.wx4.errors import KeyNotFoundError, WechatNotRunningError
 
 APP_TITLE = "微信客户沟通记录提取与总结工具"
 # 字体按平台自适配：Windows 用微软雅黑；macOS 用苹方（PingFang SC），缺失时回退系统默认
@@ -53,11 +58,45 @@ CLR_ERR = "#B3261E"
 RENDER_LIMIT = 2000          # 列表单次渲染上限：超过则只显示前 N 条并提示用搜索缩小（避免万级数据卡死）
 
 
+def parse_curl_config(text: str) -> tuple:
+    """从粘贴的 cURL 命令里解析出 (base_url, model, api_key)；解析不到对应项返回空串。
+
+    支持常见写法: 单/双引号、\\ 续行、-H/--header、-d/--data、URL 后可带 -X POST。
+    """
+    url = model = key = ""
+    if not text:
+        return url, model, key
+    # 归一: 去掉续行反斜杠, 合并换行
+    s = re.sub(r"\\\s*\n", " ", text)
+    s = s.replace("\r", " ")
+    # URL: 第一个 http(s)://... 直到空白或引号
+    m = re.search(r"https?://[^\s'\"\\]+", s)
+    if m:
+        url = m.group(0).rstrip(",;")
+    # Authorization: Bearer <key>（允许 -H/--header, 单双引号）
+    m = re.search(r"""(?:-H|--header)\s+['"]?\s*Authorization:\s*Bearer\s+([A-Za-z0-9_\-\.]+)""",
+                  s, re.I)
+    if not m:
+        m = re.search(r"""Authorization:\s*Bearer\s+([A-Za-z0-9_\-\.]+)""", s, re.I)
+    if m:
+        key = m.group(1)
+    # model: -d/--data 里 JSON 的 "model": "xxx"
+    m = re.search(r"""(?:-d|--data(?:-raw)?)\s+['"](.*?)['"](?=\s|$)""", s, re.S)
+    body = m.group(1) if m else s
+    m = re.search(r"""['"]?model['"]?\s*:\s*['"]([^'"]+)['"]""", body)
+    if m:
+        model = m.group(1)
+    return url, model, key
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1180x830")
+        # 高 DPI 缩放下,固定 1180x830 会被 Windows 放大后超出可视区, 导致底部
+        # "结果区/导出到Excel"被推出屏幕。开启 DPI 感知并自适应屏幕, 保证全屏可见。
+        self._enable_dpi_awareness()
+        self._set_adaptive_geometry()
         self.minsize(1040, 720)
 
         self.cfg: Dict = config.load()
@@ -68,6 +107,9 @@ class App(tk.Tk):
         self.summaries: List[Summary] = []
         self.msg_q: "queue.Queue[tuple]" = queue.Queue()
         self.busy = False
+        # 主列表 类型筛选 + 排序 状态 (_build_left 会创建 var_kind)
+        self._sort_field: str = ""      # ""=默认(加载顺序) | name/kind/cnt/last
+        self._sort_rev: bool = False
 
         self._source_meta = {c[0]: c for c in choices()}
 
@@ -78,6 +120,41 @@ class App(tk.Tk):
         self._apply_preset("7d")
         self.after(120, self._drain_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ================= 窗口适配(高 DPI 缩放) =================
+    @staticmethod
+    def _enable_dpi_awareness() -> None:
+        """让 Tk 按物理像素渲染, 避免 Windows 将窗口放大后超出屏幕。"""
+        try:
+            import ctypes
+            # Win 8.1+: PER_MONITOR_DPI_AWARE / SYSTEM_DPI_AWARE
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                import ctypes
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+    def _set_adaptive_geometry(self) -> None:
+        """窗口尺寸适配屏幕工作区: 不超屏幕, 居中, 保证底部("导出到Excel")可见。"""
+        try:
+            sw = self.winfo_screenwidth()
+            # 粗算可用高度(减任务栏)
+            sh = self.winfo_screenheight()
+            # 需求尺寸
+            want_w, want_h = 1180, 830
+            # 超出屏幕则收缩(留边距)
+            w = min(want_w, max(1040, sw - 40))
+            h = min(want_h, max(720, sh - 80))
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+            # 若工作区高度太小(小屏/高缩放), 直接最大化确保全部可见
+            if sh < 760:
+                self.state("zoomed")
+        except Exception:
+            self.geometry("1180x830")
 
     # ================= 样式 =================
     def _init_style(self) -> None:
@@ -135,7 +212,7 @@ class App(tk.Tk):
         f1.grid(row=0, column=0, sticky="ew")
         f1.columnconfigure(1, weight=1)
 
-        self.var_source = tk.StringVar(value=self.cfg.get("source", "demo"))
+        self.var_source = tk.StringVar(value=self.cfg.get("source", "wx4"))
         self.cbo_source = ttk.Combobox(f1, state="readonly", width=52,
                                        values=[m[1] for m in self._source_meta.values()])
         self.cbo_source.grid(row=0, column=0, columnspan=3, sticky="ew")
@@ -169,15 +246,27 @@ class App(tk.Tk):
         self.lbl_src_state = ttk.Label(bar, text="尚未加载", style="Hint.TLabel")
         self.lbl_src_state.pack(side="left", padx=8)
 
-        # 辅助工具：WeChatDataAnalysis 启动器（已装→直接启动；未装→打开安装包）
-        wda = ttk.Frame(f1)
-        wda.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        self.btn_wda = ttk.Button(wda, text="启动 WeChatDataAnalysis",
-                                  command=self._launch_wda)
-        self.btn_wda.pack(side="left")
-        self.lbl_wda = ttk.Label(wda, text="", style="Hint.TLabel")
-        self.lbl_wda.pack(side="left", padx=8)
-        self._refresh_wda_status()
+        # 全局进度条（加载/抓取密钥等操作时显示）
+        self.frm_progress = ttk.Frame(f1)
+        self.frm_progress.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        self.progress = ttk.Progressbar(self.frm_progress, mode="indeterminate", length=520)
+        self.progress.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.lbl_progress = ttk.Label(self.frm_progress, text="", style="Hint.TLabel")
+        self.lbl_progress.grid(row=0, column=1, sticky="w")
+        self.frm_progress.grid_remove()  # 默认隐藏
+
+        # 微信 4.x 直读状态面板（仅 wx4 源显示）
+        self.frm_wx4 = ttk.Frame(f1)
+        self.frm_wx4.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.frm_wx4.columnconfigure(1, weight=1)
+        self.lbl_wx4_status = ttk.Label(self.frm_wx4, text="", style="Hint.TLabel")
+        self.lbl_wx4_status.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        self.btn_wx4_capture = ttk.Button(self.frm_wx4, text="抓取数据库密钥", command=self._wx4_capture_key)
+        self.btn_wx4_capture.grid(row=1, column=0, sticky="w")
+        self.lbl_wx4_key_state = ttk.Label(self.frm_wx4, text="", style="Hint.TLabel")
+        self.lbl_wx4_key_state.grid(row=1, column=1, sticky="w", padx=8)
+        self._wx4_refresh_status()
+        self.frm_wx4.grid_remove()  # 默认隐藏，选择 wx4 时显示
 
         # ② 聊天对象
         f2 = ttk.Labelframe(left, text=" ② 勾选聊天对象（可搜索、可多选） ", padding=10)
@@ -196,6 +285,12 @@ class App(tk.Tk):
         self.var_only_picked = tk.BooleanVar(value=False)
         ttk.Checkbutton(srow, text="只看已勾选", variable=self.var_only_picked,
                         command=self._refresh_list).grid(row=0, column=2)
+        ttk.Label(srow, text="类型：").grid(row=0, column=3, padx=(10, 2))
+        self.var_kind = tk.StringVar(value="全部")
+        ttk.Combobox(srow, textvariable=self.var_kind, width=6,
+                     values=("全部", "好友", "群聊"), state="readonly"
+                     ).grid(row=0, column=4)
+        self.var_kind.trace_add("write", lambda *_: self._refresh_list())
 
         brow = ttk.Frame(f2)
         brow.grid(row=1, column=0, sticky="ew", pady=(6, 4))
@@ -221,7 +316,14 @@ class App(tk.Tk):
             ("kind", "类型", 52, "center"), ("cnt", "消息数", 62, "e"),
             ("last", "最近活跃", 96, "center"),
         ):
-            self.tv.heading(cid, text=text)
+            # 名称/类型/消息数/最近活跃 列头可点击排序; "选" 列不排序。
+            # 注意:command 传 None 会在部分 tkinter 版本报 'value for "-command" missing',
+            # 故非排序列不传 command 参数。
+            if cid == "sel":
+                self.tv.heading(cid, text=text)
+            else:
+                self.tv.heading(cid, text=text,
+                                command=(lambda c=cid: self._toggle_sort(c)))
             self.tv.column(cid, width=w, anchor=anchor,
                            stretch=(cid == "name"), minwidth=w)
         self.tv.tag_configure("on", background=CLR_SEL)
@@ -369,6 +471,16 @@ class App(tk.Tk):
         self.lbl_res = ttk.Label(brow, text="暂无结果", style="Hint.TLabel")
         self.lbl_res.pack(side="right")
 
+    # ================= 进度条 =================
+    def _show_progress(self, text: str) -> None:
+        self.frm_progress.grid()
+        self.lbl_progress.configure(text=text)
+        self.progress.start(10)
+
+    def _hide_progress(self) -> None:
+        self.progress.stop()
+        self.frm_progress.grid_remove()
+
     # ================= 数据源交互 =================
     def _source_key(self) -> str:
         label = self.cbo_source.get()
@@ -401,54 +513,132 @@ class App(tk.Tk):
         else:
             self.ent_path.configure(state="disabled")
             self.btn_path.configure(state="disabled")
-        if key in ("import", "wxdb"):
+        if key in ("import", "wxdb", "wx4"):
             self.frm_self.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         else:
             self.frm_self.grid_remove()
+        # wx4 专属面板:显示微信状态与密钥抓取按钮
+        if key == "wx4":
+            self.frm_wx4.grid()
+            self._wx4_refresh_status()
+        else:
+            self.frm_wx4.grid_remove()
         self.lbl_src_state.configure(text="尚未加载")
 
-    # ---------- WeChatDataAnalysis 启动器 ----------
-    def _refresh_wda_status(self) -> None:
-        """根据探测结果刷新按钮文案与状态标签。"""
-        try:
-            st, _path = wda_launcher.detect_status()
-        except Exception:
-            st, _path = "missing", None
-        if st == "installed":
-            self.btn_wda.configure(text="启动 WeChatDataAnalysis")
-            self.lbl_wda.configure(text="已安装 ✓", foreground=CLR_OK)
-        elif st == "not_installed":
-            self.btn_wda.configure(text="安装并启动 WeChatDataAnalysis")
-            self.lbl_wda.configure(text="未安装 · 点击打开安装包", foreground=CLR_MUTE)
-        else:
-            self.btn_wda.configure(text="安装 WeChatDataAnalysis")
-            self.lbl_wda.configure(text="未安装 · 缺安装包", foreground=CLR_ERR)
+    # ---------- wx4 微信直读面板 ----------
+    def _wx4_refresh_status(self) -> None:
+        """异步刷新微信运行状态与密钥缓存状态(不阻塞 GUI)。"""
+        self.lbl_wx4_status.configure(text="正在探测微信环境…", foreground=CLR_MUTE)
+        self.lbl_wx4_key_state.configure(text="", foreground=CLR_MUTE)
+        threading.Thread(target=self._wx4_do_refresh, daemon=True).start()
 
-    def _launch_wda(self) -> None:
-        """点击 WeChatDataAnalysis 按钮：已装则启动，未装则打开安装包。"""
+    def _wx4_do_refresh(self) -> None:
+        """后台线程:探测微信环境并更新 UI(选中活跃账号,换账号后能感知)。"""
         try:
-            res = wda_launcher.launch_wda()
-        except Exception as e:  # 拉起失败不要静默
-            self.var_status.set(f"WeChatDataAnalysis 启动出错：{e}")
-            return
-        self._refresh_wda_status()
-        if res["action"] == "launched":
-            self.var_status.set("已启动 WeChatDataAnalysis。")
-        elif res["action"] == "installer":
-            messagebox.showinfo(
-                "未安装，已打开安装包",
-                "本机尚未检测到 WeChatDataAnalysis。\n\n"
-                "已为你打开安装包，请按向导完成安装；安装完成后再次点击"
-                "「启动 WeChatDataAnalysis」即可运行。")
-            self.var_status.set("未安装，已打开安装包，请安装后重试。")
+            # 强制刷新环境(换账号后 detect 的 60s 缓存会掩盖新账号)。
+            env = locate.detect_wechat_env(force=True)
+            # 账号选择规则与「加载聊天对象」(wx4_live._resolve_account) 保持一致:
+            #   微信运行中 -> 选活跃(正在登录)账号; 否则 -> 有缓存密钥的账号。
+            acc = None
+            if env.accounts:
+                if env.running:
+                    acc = env.accounts[0]  # detect 已按活跃度排序, 首位即正在登录账号
+                else:
+                    for a in env.accounts:
+                        if keyring.has_key(a.account):
+                            acc = a
+                            break
+                    if acc is None:
+                        acc = env.accounts[0]
+            if acc:
+                has_key = keyring.has_key(acc.account)
+                if env.running:
+                    wechat_state = "微信运行中 ✓"
+                else:
+                    wechat_state = "微信未运行"
+                if has_key:
+                    key_state = "密钥已缓存 ✓"
+                    self.after(0, self.lbl_wx4_key_state.configure,
+                               text=key_state, foreground=CLR_OK)
+                else:
+                    key_state = "未抓取密钥"
+                    self.after(0, self.lbl_wx4_key_state.configure,
+                               text=key_state, foreground=CLR_ERR)
+                self.after(0, self.lbl_wx4_status.configure,
+                           text=f"账号: {acc.account} | {wechat_state}")
+            else:
+                self.after(0, self.lbl_wx4_status.configure,
+                           text="未检测到微信账号", foreground=CLR_ERR)
+                self.after(0, self.lbl_wx4_key_state.configure,
+                           text="", foreground=CLR_ERR)
+        except Exception as e:
+            self.after(0, self.lbl_wx4_status.configure,
+                       text=f"检测失败: {e}", foreground=CLR_ERR)
+            self.after(0, self.lbl_wx4_key_state.configure,
+                       text="", foreground=CLR_ERR)
+
+    def _wx4_capture_key(self) -> None:
+        """抓取微信 4.x 数据库密钥（后台线程执行，不阻塞 GUI）。
+
+        优先走「不重启」的 V4 只读内存扫描(微信 4.x 活跃账号的密钥在内存中可取);
+        仅当 V4 扫描失败(如非活跃账号/微信未运行)才提示是否重启抓取。
+        """
+        try:
+            env = locate.detect_wechat_env(force=True)
+            if not env.accounts:
+                messagebox.showerror("未找到账号", "未在本机找到已登录的微信 4.x 账号数据目录。")
+                return
+
+            # 微信运行中: 先试不重启的 V4 内存扫描(活跃账号密钥在内存, 秒级可取)。
+            if env.running:
+                self._show_progress("正在扫描微信进程内存(只读, 不重启)…")
+                threading.Thread(target=self._wx4_do_capture,
+                                 args=(env, False),
+                                 daemon=True).start()
+                return
+
+            # 微信未运行: 只能重启抓取。
+            ret = messagebox.askyesno(
+                "微信未运行",
+                "微信当前未运行。\n\n"
+                "是否自动启动微信并抓取密钥？\n"
+                "（启动后请在微信窗口扫码登录,等待约 1 分钟自动登录）")
+            if not ret:
+                return
+            self._show_progress("正在启动微信并抓取密钥（请扫码登录）…")
+            threading.Thread(target=self._wx4_do_capture,
+                             args=(env, True),
+                             daemon=True).start()
+        except Exception as e:
+            self._hide_progress()
+            messagebox.showerror("错误", f"抓取过程出错: {e}")
+
+    def _wx4_do_capture(self, env, restart):
+        """后台线程：依次尝试所有已检测账号，找到密钥即停。"""
+        from core.wx4.memkey import capture_key
+        last_err = ""
+        for acc in env.accounts:
+            try:
+                key = capture_key(acc, progress_cb=lambda s: self.var_status.set(s),
+                                  restart=restart, timeout=240)
+                keyring.save_key(acc.account, key,
+                                 wechat_version=env.version or "",
+                                 wechat_exe=env.exe_path or "")
+                self.msg_q.put(("wx4_key_ok",
+                    f"密钥抓取成功！\n账号: {acc.account}"))
+                return
+            except (KeyNotFoundError, WechatNotRunningError) as e:
+                last_err = str(e)
+                continue
+            except Exception as e:
+                last_err = f"抓取过程出错: {e}"
+                continue
+        if restart:
+            self.msg_q.put(("wx4_key_err",
+                f"尝试了 {len(env.accounts)} 个账号均未找到密钥(重启模式也失败)。\n{last_err}"))
         else:
-            pkg = wda_launcher.tools_root()
-            messagebox.showerror(
-                "未找到安装包",
-                f"本机未安装 WeChatDataAnalysis，且 tools/wechatdataanalysis/ 下没有安装包。\n\n"
-                f"请把{wda_launcher.installer_hint()}放到：\n"
-                f"{pkg}/wechatdataanalysis/")
-            self.var_status.set("未找到安装包，请先放入 tools/wechatdataanalysis/。")
+            # V4 无重启扫描失败: 提示可再试重启模式(覆盖非活跃账号)。
+            self.msg_q.put(("wx4_key_restart_hint", last_err))
 
     def _pick_path(self) -> None:
         from core.sources import REGISTRY
@@ -472,12 +662,14 @@ class App(tk.Tk):
         if self.busy:
             return
         self._sync_cfg()
+        self._show_progress("正在加载聊天对象（首次加载需解密数据库，稍候）…")
         self.lbl_src_state.configure(text="正在加载…")
         self._set_busy(True)
 
         def work():
             try:
-                items = pipeline.load_contacts(self.cfg)
+                items = pipeline.load_contacts(self.cfg,
+                                               progress_cb=lambda s: self.var_status.set(s))
                 self.msg_q.put(("contacts", items))
             except SourceError as e:
                 self.msg_q.put(("error", ("加载聊天对象失败", str(e))))
@@ -489,11 +681,60 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     # ================= 列表渲染 =================
+    # 类型筛选/排序 共用逻辑 ================
+    @staticmethod
+    def _kind_code(label: str) -> str:
+        """「全部/好友/群聊」→ '' / 'friend' / 'group'。"""
+        for code, lab in (("friend", "好友"), ("group", "群聊"), ("", "全部")):
+            if label == lab:
+                return code
+        return ""
+
+    def _apply_kind(self, contacts, kind_label) -> list:
+        code = self._kind_code(kind_label)
+        if not code:
+            return list(contacts)
+        return [c for c in contacts if c.kind == code]
+
+    @staticmethod
+    def _kind_label(kind) -> str:
+        return KIND_LABEL.get(kind, KIND_LABEL.get("unknown", "未知"))
+
+    @staticmethod
+    def _sort_key(field: str, c: Contact):
+        if field == "name":
+            return (c.name or "").lower()
+        if field == "kind":
+            return KIND_LABEL.get(c.kind, "未知")
+        if field == "cnt":
+            return c.msg_count or 0
+        if field == "last":
+            return c.last_time or datetime.min
+        return 0
+
+    def _sort_contacts(self, contacts, field, reverse=False) -> list:
+        if not field:
+            return contacts
+        return sorted(contacts, key=lambda c: self._sort_key(field, c),
+                      reverse=reverse)
+
+    def _toggle_sort(self, field: str) -> None:
+        if self._sort_field == field:
+            self._sort_rev = not self._sort_rev
+        else:
+            self._sort_field = field
+            self._sort_rev = False
+        self._refresh_list()
+
     def _refresh_list(self) -> None:
         kw = self.var_search.get().strip()
         filtered = pipeline.filter_contacts(self.contacts, kw)
+        # 类型筛选
+        filtered = self._apply_kind(filtered, self.var_kind.get())
         if self.var_only_picked.get():
             filtered = [c for c in filtered if c.cid in self.picked]
+        # 排序(排序后再截断,使"前 N 条"按排序生效)
+        filtered = self._sort_contacts(filtered, self._sort_field, self._sort_rev)
         self.filtered = filtered
         shown = filtered[:RENDER_LIMIT]
         self.visible = shown
@@ -503,11 +744,17 @@ class App(tk.Tk):
             self.tv.insert(
                 "", "end", iid=c.cid,
                 values=(MARK_ON if on else MARK_OFF, c.name,
-                        {"friend": "好友", "group": "群聊"}.get(c.kind, "—"),
+                        self._kind_label(c.kind),
                         c.msg_count or "—",
                         c.last_time.strftime("%Y-%m-%d") if c.last_time else "—"),
                 tags=("on",) if on else (),
             )
+        # 列头排序箭头
+        for cid, text in (("name", "聊天对象名称"), ("kind", "类型"),
+                          ("cnt", "消息数"), ("last", "最近活跃")):
+            arrow = " ▼" if (self._sort_field == cid and self._sort_rev) else \
+                    " ▲" if self._sort_field == cid else ""
+            self.tv.heading(cid, text=f"{text}{arrow}")
         self._update_pick_label()
 
     def _update_pick_label(self) -> None:
@@ -573,8 +820,20 @@ class App(tk.Tk):
         ttk.Checkbutton(srow, text="只看已勾选", variable=p_only,
                         command=lambda: self._refresh_picker(win, p_search, p_only, p_tv, p_lbl)
                         ).grid(row=0, column=2)
+        ttk.Label(srow, text="类型：").grid(row=0, column=3, padx=(10, 2))
+        win._kind = tk.StringVar(value="全部")
+        ttk.Combobox(srow, textvariable=win._kind, width=6,
+                     values=("全部", "好友", "群聊"), state="readonly"
+                     ).grid(row=0, column=4)
+        win._kind.trace_add(
+            "write",
+            lambda *_: self._refresh_picker(win, p_search, p_only, p_tv, p_lbl))
+        win._sort_field = ""      # 独立窗口排序状态(独立于主列表)
+        win._sort_rev = False
+        ttk.Label(srow, text="点列头排序", style="Hint.TLabel"
+                  ).grid(row=0, column=5, padx=(8, 0))
         ttk.Label(srow, text="勾选实时生效，关闭窗口即应用。", style="Hint.TLabel"
-                  ).grid(row=0, column=3, padx=10)
+                  ).grid(row=0, column=6, padx=(10, 0))
 
         wrap = ttk.Frame(win)
         wrap.grid(row=1, column=0, sticky="nsew", padx=12)
@@ -587,7 +846,13 @@ class App(tk.Tk):
             ("kind", "类型", 52, "center"), ("cnt", "消息数", 72, "e"),
             ("last", "最近活跃", 110, "center"),
         ):
-            p_tv.heading(cid, text=text)
+            # command 传 None 会在部分 tkinter 版本报错,故 "选" 列不传 command。
+            if cid == "sel":
+                p_tv.heading(cid, text=text)
+            else:
+                p_tv.heading(cid, text=text, command=(
+                    lambda c=cid: self._toggle_pick_sort(
+                        win, c, p_search, p_only, p_tv, p_lbl)))
             p_tv.column(cid, width=w, anchor=anchor, stretch=(cid == "name"), minwidth=w)
         p_tv.tag_configure("on", background=CLR_SEL)
         p_tv.grid(row=0, column=0, sticky="nsew")
@@ -614,21 +879,40 @@ class App(tk.Tk):
         self._refresh_picker(win, p_search, p_only, p_tv, p_lbl)
         win.focus_set()
 
+    def _toggle_pick_sort(self, win, field, p_search, p_only, p_tv, p_lbl) -> None:
+        if win._sort_field == field:
+            win._sort_rev = not win._sort_rev
+        else:
+            win._sort_field = field
+            win._sort_rev = False
+        self._refresh_picker(win, p_search, p_only, p_tv, p_lbl)
+
     def _refresh_picker(self, win, p_search, p_only, p_tv, p_lbl) -> None:
         kw = p_search.get().strip()
         filtered = pipeline.filter_contacts(self.contacts, kw)
+        # 类型筛选
+        filtered = self._apply_kind(filtered, win._kind.get())
         if p_only.get():
             filtered = [c for c in filtered if c.cid in self.picked]
+        # 排序(独立窗口独立排序状态)
+        if win._sort_field:
+            filtered = self._sort_contacts(filtered, win._sort_field, win._sort_rev)
         shown = filtered[:RENDER_LIMIT]
         p_tv.delete(*p_tv.get_children())
         for c in shown:
             on = c.cid in self.picked
             p_tv.insert("", "end", iid=c.cid,
                         values=(MARK_ON if on else MARK_OFF, c.name,
-                                {"friend": "好友", "group": "群聊"}.get(c.kind, "—"),
+                                self._kind_label(c.kind),
                                 c.msg_count or "—",
                                 c.last_time.strftime("%Y-%m-%d") if c.last_time else "—"),
                         tags=("on",) if on else ())
+        # 列头排序箭头(仅独立窗口的 4 个排序列)
+        for cid, text in (("name", "聊天对象名称"), ("kind", "类型"),
+                          ("cnt", "消息数"), ("last", "最近活跃")):
+            arrow = " ▼" if (win._sort_field == cid and win._sort_rev) else \
+                    " ▲" if win._sort_field == cid else ""
+            p_tv.heading(cid, text=f"{text}{arrow}")
         total = len(filtered)
         if total > RENDER_LIMIT:
             extra = f"  ·  仅显示前 {len(shown)} 个（共 {total} 个），搜索可缩小范围"
@@ -784,10 +1068,32 @@ class App(tk.Tk):
                     self._on_result(payload)
                 elif kind == "error":
                     title, msg = payload
+                    self._hide_progress()
                     self.var_status.set(f"{title}：{msg.splitlines()[0]}")
                     messagebox.showerror(title, msg)
+                elif kind == "wx4_key_ok":
+                    self._hide_progress()
+                    self._wx4_refresh_status()
+                    messagebox.showinfo("成功", payload)
+                elif kind == "wx4_key_err":
+                    self._hide_progress()
+                    messagebox.showerror("抓取失败", payload)
+                elif kind == "wx4_key_restart_hint":
+                    # V4 无重启扫描失败(非活跃账号/密钥不在内存): 询问是否重启重试。
+                    self._hide_progress()
+                    ret = messagebox.askyesno(
+                        "未取到密钥",
+                        f"未能在运行中的微信内存里找到密钥。\n{payload}\n\n"
+                        "是否重启微信后重试？（重启后请扫码登录，覆盖非活跃账号）")
+                    if ret:
+                        env = locate.detect_wechat_env(force=True)
+                        self._show_progress("正在重启微信并抓取密钥（请扫码登录）…")
+                        threading.Thread(target=self._wx4_do_capture,
+                                         args=(env, True),
+                                         daemon=True).start()
                 elif kind in ("done_load", "done_run"):
                     self._set_busy(False)
+                    self._hide_progress()
                     if kind == "done_load":
                         self.lbl_src_state.configure(
                             text=self.lbl_src_state.cget("text").replace("正在加载…", "加载结束"))
@@ -934,7 +1240,6 @@ class App(tk.Tk):
 
     # ================= 设置与帮助 =================
     def _open_ai_settings(self) -> None:
-        # 思考深度：推理类模型(hy3/kimi 等)默认会深度思考，把 max_tokens 预算吃光导致正文为空；
         # 短总结场景选「关闭」可大幅降延迟与消耗。仅推理模型识别此参数，其它模型可留「自动」。
         _THINK_LABEL = {"": "自动", "disabled": "关闭（短总结推荐）", "enabled": "开启（深度思考）"}
         _THINK_VAL = {"自动": "", "关闭（短总结推荐）": "disabled", "开启（深度思考）": "enabled"}
@@ -1092,6 +1397,72 @@ class App(tk.Tk):
             win.destroy()
             self.var_status.set("AI 设置已保存。")
 
+        # 左：腾讯云 DSV4 免费额度获取（跳转控制台领取，用默认浏览器打开）
+        _DSV4_URL = ("https://console.cloud.tencent.com/tokenhub/models/detail"
+                     "?modelId=deepseek-v4-flash-0731&regionId=1&from=all")
+
+        def _open_dsv4_free_quota() -> None:
+            try:
+                webbrowser.open(_DSV4_URL)
+            except Exception as exc:
+                messagebox.showerror("打开失败",
+                                     f"无法打开浏览器，请手动复制以下链接前往：\n{_DSV4_URL}\n\n{exc}")
+
+        ttk.Button(row, text="腾讯云DSV4免费额度获取",
+                   command=_open_dsv4_free_quota).pack(side="left")
+
+        def _open_import_key() -> None:
+            """打开窗口, 粘贴腾讯云 cURL, 解析后自动填入接口地址/模型/API Key。"""
+            dlg = tk.Toplevel(win)
+            dlg.title("导入 API Key（粘贴 cURL）")
+            dlg.geometry("620x420")
+            dlg.transient(win)
+            dlg.grab_set()
+            f = ttk.Frame(dlg, padding=12)
+            f.pack(fill="both", expand=True)
+            f.columnconfigure(0, weight=1)
+            f.rowconfigure(1, weight=1)
+            ttk.Label(f, text="把控制台里复制的 cURL 命令粘贴到下面，点「导入」自动填写 "
+                               "接口地址 / 模型名称 / API Key：",
+                      style="Hint.TLabel", wraplength=580, justify="left"
+                      ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+            txt = tk.Text(f, wrap="word", height=12, font=("Consolas", 9))
+            txt.grid(row=1, column=0, sticky="nsew")
+            sb = ttk.Scrollbar(f, orient="vertical", command=txt.yview)
+            sb.grid(row=1, column=1, sticky="ns")
+            txt.configure(yscrollcommand=sb.set)
+            btnf = ttk.Frame(f)
+            btnf.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+            def do_import():
+                raw = txt.get("1.0", "end").strip()
+                if not raw:
+                    messagebox.showwarning("请输入", "请先粘贴 cURL 命令内容。", parent=dlg)
+                    return
+                url, model, key = parse_curl_config(raw)
+                if not (url or model or key):
+                    messagebox.showerror("解析失败",
+                                         "未能从内容里识别出接口地址/模型/API Key。\n"
+                                         "请确认粘贴的是完整的 cURL 命令（含 URL、"
+                                         "Authorization: Bearer 与 model 字段）。", parent=dlg)
+                    return
+                filled = []
+                if url:
+                    v_url.set(url); filled.append("接口地址")
+                if model:
+                    v_model.set(model); filled.append("模型名称")
+                if key:
+                    v_key.set(key); filled.append("API Key")
+                dlg.destroy()
+                self.var_status.set("已导入：" + "、".join(filled) + "。请确认后点「保存」。")
+
+            ttk.Button(btnf, text="导入", command=do_import).pack(side="right")
+            ttk.Button(btnf, text="取消", command=dlg.destroy).pack(side="right", padx=6)
+            txt.focus_set()
+
+        ttk.Button(row, text="导入API KEY", command=_open_import_key
+                   ).pack(side="left", padx=(6, 0))
+        # 右：保存 / 取消
         ttk.Button(row, text="保存", command=save).pack(side="right")
         ttk.Button(row, text="取消", command=win.destroy).pack(side="right", padx=6)
 
@@ -1105,7 +1476,7 @@ class App(tk.Tk):
     def _show_help(self) -> None:
         messagebox.showinfo("使用说明", (
             "六步走完，全程不用敲命令：\n\n"
-            "① 选择聊天记录来源。第一次用建议先选「内置样例数据」，跑一遍看产出格式。\n"
+            "① 选择聊天记录来源。默认「本机微信 4.x 加密库直读」，自动探测本机微信并读取。\n"
             "② 点「加载聊天对象」，在列表里勾选客户。可以先搜索再勾，搜索不会清空已勾选；"
             "对象很多时点「独立窗口选择…」更顺手。\n"
             "③ 选时间范围。点「近 7 天」「本月」这类按钮最省事，也可手填日期。\n"
@@ -1114,23 +1485,24 @@ class App(tk.Tk):
             "⑤ 设 Excel 保存位置（追加/覆盖）+ 客户阶段侧重（影响段落优先级）。\n"
             "⑥ 点「开始提取并生成总结」，下方表格双击可改文字，再「导出到 Excel」。\n\n"
             "Excel 固定三列：客户名称 / 时间范围 / 总结内容。\n"
-            "提示：① 框底部有「启动 WeChatDataAnalysis」按钮，可一键拉起或安装该取数工具。"
+            "提示：选择「本机微信 4.x 加密库直读」后，点击「抓取数据库密钥」即可一键获取密钥。"
         ))
 
     def _show_source_help(self) -> None:
         messagebox.showinfo("数据来源说明（重要）", (
-            "微信的聊天记录存在本机一个加密数据库里，密钥在微信进程内存中。\n"
-            "本工具刻意不去读微信进程内存，原因有三：这类手段会随微信版本更新失效、"
-            "可能触发账号风控、在企业合规审查里也难以说清。\n\n"
-            "因此提供三种取数方式：\n\n"
-            "1) 内置样例数据 —— 免配置。用于试用、培训、验收产出格式。\n\n"
-            "2) 导入聊天记录文件（推荐）—— 用 WeChatDataAnalysis / 留痕 / WeChatMsg 等工具把记录导出成 "
-            "csv / txt / json 或整包 .zip，本工具直接读（.zip 自动解压）。一个会话对应一个聊天对象，"
-            "会话名取自导出里的真实名称。这条路最稳、最好解释。\n"
-            "   · 需要先导出微信数据？点 ① 框底部的「启动 WeChatDataAnalysis」：已装直接拉起，"
-            "没装则打开安装包（安装包放 tools/wechatdataanalysis/ 下）。\n\n"
-            "3) 读取已解密的微信数据库 —— 用外部工具解密出 MicroMsg.db 与 MSG*.db（或整包 .zip 存档），"
-            "选那个压缩包或文件夹即可。本工具只以只读方式读取，不解密、不碰微信进程。\n\n"
+            "微信的聊天记录存在本机一个加密数据库里，密钥在微信进程内存中。\n\n"
+            "本工具提供四种取数方式：\n\n"
+            "1) 本机微信 4.x 加密库直读（Windows）—— 自动探测本机已登录的微信 4.x 账号，"
+            "只读扫描微信进程内存来抓取数据库密钥（无注入、无重启、无网络）。\n"
+            "   · 首次使用请在微信保持登录状态，点「加载聊天对象」自动抓取密钥并缓存；\n"
+            "   · 若密钥未缓存，可点「加载聊天对象」→ 自动触发抓取（需微信运行中）；\n"
+            "   · 也可通过命令行 python cli.py wx4-capture --restart 重启微信后抓取。\n\n"
+            "2) 内置样例数据 —— 免配置。用于试用、培训、验收产出格式。\n\n"
+            "3) 导入聊天记录文件（推荐 · 跨平台）—— 把聊天记录导出成 csv / txt / json 或整包 .zip，"
+            "本工具直接读（.zip 自动解压）。一个会话对应一个聊天对象，会话名取自导出里的真实名称。"
+            "导出途径由用户自行掌握。\n\n"
+            "4) 读取已解密的微信数据库 —— 选择已解密的 MicroMsg.db 与 MSG*.db（或整包 .zip 存档），"
+            "本工具只读访问；解密由用户在自行信任的途径完成。\n\n"
             "【AI 总结】第④步「AI 总结设置…」里，「模型来源」选「WorkBuddy 模型」即可直接选用你本机 "
             "WorkBuddy 已配置的模型（kimi / deepseek / doubao 等），生成时即调用该模型，无需手填地址与密钥；"
             "也可选「手动填写」接任意 OpenAI 兼容接口。注意：WorkBuddy 的推理模型（kimi 系）不支持"
@@ -1159,15 +1531,47 @@ class App(tk.Tk):
         self.destroy()
 
 
+def _try_restore_existing() -> bool:
+    """若已有实例的主窗口在运行(可能被最小化), 还原并置前, 返回 True。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        hwnd = u.FindWindowW(None, APP_TITLE)
+        if not hwnd:
+            return False
+        # SW_RESTORE=9; 最小化时还原到原位置并置前
+        u.ShowWindow(hwnd, 9)
+        u.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
 def main() -> None:
+    # 单实例: 用一个命名互斥体判断是否已有实例在运行。
+    # 场景: 用户把窗口最小化到任务栏后, 再次双击启动工具.exe, 若已有实例,
+    # 就直接把已有窗口还原置前并退出本次启动, 避免"打不开/多开多个"。
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        _mutex = kernel32.CreateMutexW(None, False, "Global\\wxcsm_启动工具_single")
+        already = kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        _mutex, already = None, False
+    if already and _try_restore_existing():
+        return  # 已有实例并已还原, 不重复启动
+
     app = App()
+    app._mutex = _mutex  # 持有句柄, 防止被 GC 导致锁失效
     app.mainloop()
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:  # 窗口化启动时异常不会显示在控制台，必须自己留痕
+    except Exception as e:  # 窗口化启动时异常不会显示在控制台，必须自行记录日志
         import traceback as _tb
         from pathlib import Path as _P
         log_path = _P(__file__).resolve().parent / "启动工具崩溃.log"
