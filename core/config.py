@@ -11,7 +11,7 @@ CONFIG_DIR = Path.home() / ".wxcsm"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 DEFAULTS: Dict[str, Any] = {
-    "source": "demo",
+    "source": "wx4",
     "source_path": "",
     "self_names": [],                                 # 代表「我方」的发送人名：导入源（真实姓名无我方标记时）+ 解密数据库源（校正群聊归错人、统一显示名字）共用
     "engine": "auto",                                  # auto | ai | offline
