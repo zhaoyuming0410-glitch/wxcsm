@@ -19,3 +19,17 @@ venv/
 启动工具.bat
 _ai_batch_test.xlsx
 _ai_real_test.xlsx
+
+# macOS 打包产物（make_macos.py 输出，mac 上生成，不进版本库）
+dist_mac/
+# 崩溃日志（PyInstaller windowed 启动失败时写入 __file__ 旁）
+启动工具崩溃.log
+
+# 开发辅助/CI 脚本(含个人GitHub标识, 不提交)
+monitor_build.py
+push_via_api.py
+wait_download.py
+_privacy_scan.py
+
+# 调试/临时脚本(含本机路径, 不提交)
+/_*.py
