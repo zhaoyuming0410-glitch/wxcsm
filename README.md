@@ -39,19 +39,45 @@
 ## 三、数据来源：请务必读这一节
 
 微信的聊天记录存在本机一个**加密数据库**里，密钥在微信进程内存中。
-本工具**刻意不去读微信进程内存**，原因有三：
-
-1. 这类手段每逢微信大版本更新就失效，工具会随时变砖；
-2. 可能触发账号风控；
-3. 在企业合规审查里难以说清。
-
-因此提供三条取数路径，**上层功能完全一致，随时可切换**：
+本工具支持四种数据源，**上层功能完全一致，随时可切换**：
 
 | 数据源 | 适用场景 | 稳定性 | 需要准备什么 |
 |---|---|---|---|
 | **内置样例数据** | 试用、培训、验收产出格式 | ★★★★★ | 无 |
-| **导入已导出的聊天记录文件**（推荐） | 日常生产使用 | ★★★★☆ | 先用留痕 / WeChatMsg / WeChatDataAnalysis 等工具把记录导出成文件或 .zip 压缩包 |
-| **读取已解密的微信数据库** | 已有解密库的场景 | ★★☆☆☆ | 外部工具解密出的 `MicroMsg.db` + `MSG*.db`（或直接选整包 .zip 存档） |
+| **本机微信 4.x 加密库直读**（Windows） | 日常生产使用（Windows 微信 4.x） | ★★★★☆ | 微信保持登录状态，首次使用需自动抓取数据库密钥（只读内存扫描，无注入、无重启、无网络外发） |
+| **导入已导出的聊天记录文件**（推荐·跨平台） | 日常生产使用 | ★★★★☆ | 把记录导出成文件或 .zip 压缩包（导出途径由用户自行掌握） |
+| **读取已解密的微信数据库** | 已有解密库的场景 | ★★☆☆☆ | 已解密的 `MicroMsg.db` + `MSG*.db`（或直接选整包 .zip 存档） |
+
+### wx4 直读模式（Windows 微信 4.x 加密库）
+
+自动探测本机已安装的微信 4.x、定位账号数据目录、读取加密数据库。**无需手动导出**，一键加载。
+
+**首次使用流程：**
+1. 确保微信已登录并处于运行状态
+2. 在 GUI 中选择「直接读取本机微信（Windows 4.x）聊天记录」数据源
+3. 点「加载聊天对象」→ 自动扫描内存获取密钥（无注入、无重启）并缓存 → 解密库 → 加载联系人
+4. 密钥会被加密保存在本地（DPAPI 加密），后续使用无需重复抓取
+
+**命令行模式：**
+```bash
+# 列出可用数据源（确认 wx4 可用）
+python cli.py list-sources
+
+# 抓取数据库密钥（需微信运行中）
+python cli.py wx4-capture
+
+# 加载联系人列表
+python cli.py list-contacts --source wx4
+
+# 生成总结
+python cli.py run --source wx4 --all --preset 30d --out 总结.xlsx
+```
+
+**技术原理：**
+- 只读扫描微信进程内存（ReadProcessMemory），定位数据库密钥
+- 使用 SQLCipher4 参数（PBKDF2-SHA512 × 256000, AES-256-CBC）解密数据库
+- 解密后的数据仅暂存于 `~/.wxcsm/wx4_staging/`，使用后自动清理
+- 密钥通过 DPAPI 加密存储，仅本机当前用户可解密
 
 ### 导入模式的文件约定
 
@@ -145,12 +171,10 @@ wxcsm/
 ├── requirements.txt
 ├── make_installer.py     Windows 安装包构建（产出 .exe Setup）
 ├── installer_main.py     Windows 安装向导本体
-├── make_macos.py         macOS 安装包构建（产出 .app / .dmg，需在 Mac 运行）
-├── installer_macos.py    macOS 安装向导本体
-├── .github/workflows/build-macos.yml   GitHub Actions 自动构建 macOS 包
-├── push_via_api.py       受限网络下用 API 上传仓库（替代 git push）
-├── wait_download.py      监控构建并下载/校验 artifact（开发辅助）
-├── make_release.py       把产物发布为 GitHub Release（开发辅助）
+├── make_macos.py         macOS 打包脚本（PyInstaller 产出 .app，可选 .dmg；须在 Mac / CI 运行）
+├── .github/workflows/build-macos.yml   GitHub Actions 在 macOS runner 上自动构建 .app/.dmg
+├── push_via_api.py       （开发辅助）受限网络下用 API 上传仓库，替代 git push
+├── wait_download.py      （开发辅助）监控 Actions 构建并下载 artifact
 └── core/
     ├── models.py         数据模型
     ├── pipeline.py       业务流水线（GUI 与 CLI 共用）
@@ -161,7 +185,9 @@ wxcsm/
         ├── base.py       适配器接口
         ├── demo.py       内置样例
         ├── importer.py   文件导入（支持 .zip 自动解压）
-        └── sqlite_db.py  已解密数据库（只读，支持 .zip 自动解压）
+        ├── sqlite_db.py  已解密数据库（只读，支持 .zip 自动解压）
+        └── mac_wx4.py     macOS 微信直读适配器（见 core/mac_wx4/）
+    ├── mac_wx4/          macOS 微信直读引擎（Mach VM 扫钥+解密；尽力实现，需真机验证）
 ```
 
 想接企业微信会话存档、飞书或其他渠道？继承 `core/sources/base.py` 里的 `ChatSource`，
@@ -190,63 +216,20 @@ Excel 正开着这个文件，关掉再导一次。
 
 ---
 
-## 八、macOS 版本
+## 八、平台说明
 
-wxcsm 的 GUI 与引擎（`app.py` / `cli.py` / `core/`）本身是跨平台的（tkinter）。除 Windows 外，也已适配 macOS：
+wxcsm 的 GUI 与引擎（`app.py` / `cli.py` / `core/`）基于 tkinter，本身跨平台（Windows / macOS）。
 
-- **WDA 启动器**（`core/wda_launcher.py`）在 macOS 上会到 `/Applications`、`~/Applications` 探测 `WeChatDataAnalysis.app`，识别 `.dmg` / `.pkg` / `.zip` 安装包；启动与打开安装统一用 `open` 命令。
-- 字体、主题、缺安装包提示均按平台自适应（macOS 用苹方 PingFang SC）。
-- 分发形态与 Windows 一致：**带安装向导**，可选安装目录 + 桌面替身。
+- **Windows**：当前主要交付形态。双击安装向导即可使用，支持 4.x 加密库直读（wx4）、导入文件、已解密库等数据源。
+- **macOS**：同样的 GUI 与引擎基于 tkinter 可运行。macOS 端**不支持 wx4「直读本机微信」数据源**（其为 Windows 微信 4.x 专属机制），但内置样例 / 导入文件 / 已解密库三种数据源以及总结、AI、Excel 导出均可正常使用。
 
-### 在 Mac 上构建（无法在 Windows 交叉编译）
+macOS 版由 Windows 开发机上完成兼容化与静态/导入自检，**未在真实 macOS 微信上端到端验证**；请在 Mac 上构建后实际跑一次确认。取钥与解密（仅 Windows）均由内置纯 Python 实现完成，不依赖任何外部第三方组件。
 
-> Windows 端只能产出 Windows 的 `.exe` / `.app` 安装包；macOS 的 `.app` 必须在 macOS 上用 PyInstaller 生成，本机（Windows）无法直接编译。
+### macOS 打包与运行
 
-前置：macOS 11+，本机 Python 3.9+（系统自带 tkinter；brew 版需 `brew install python-tk`），并 `pip install pyinstaller`。
-
-1. 把 macOS 版 WeChatDataAnalysis 安装包放到：
-   ```
-   wxcsm/tools/wechatdataanalysis/
-   ```
-   **文件名必须以 `WeChatDataAnalysis` 开头**，扩展名 `.dmg` / `.pkg` / `.zip` 之一（launcher 通配 `WeChatDataAnalysis*.dmg/.pkg/.zip` 才能识别），例如 `WeChatDataAnalysis_2.3.0_macOS_arm64.dmg`。文件名不符会导致「已内嵌却找不到」。
-   （不放也能构建，但安装后的工具点「启动 WeChatDataAnalysis」会提示缺安装包，需另下载后放此目录重构建。）
-2. 在 wxcsm 目录、已激活的 venv 下运行：
-   ```bash
-   python make_macos.py            # 全量：内嵌 WDA 安装包
-   python make_macos.py --no-wda  # 精简：不含 WDA 安装包
-   python make_macos.py --dmg     # 额外打成 .dmg 便于分发
-   ```
-3. 产物在 `dist_installer/`：
-   - `微信客户沟通总结工具安装向导.app`（双击即安装向导：选目录 + 桌面替身）
-   - 可选 `微信客户沟通总结工具安装向导.dmg`
-4. 收件人双击「安装向导.app」→ 选安装目录（默认 `~/Applications`，免管理员权限）→ 安装 → 双击生成的「微信客户沟通总结工具.app」即可使用；WeChatDataAnalysis 在首次使用时由按钮打开内嵌安装包，按提示装到 `/Applications`。
-
-### 自动构建（GitHub Actions，无需本地 Mac）
-
-仓库已配置 `.github/workflows/build-macos.yml`：把代码 push 到 `main` 分支，或在 Actions 页手动 **Run workflow**，GitHub 托管的 macOS runner 会自动跑 `make_macos.py --dmg`，把产物（`.app` + `.dmg`）作为 Actions Artifact（名称 `wxcsm-macos`）上传。
-
-- **CI 产出的是「不含 WDA」的精简版**：`tools/` 被 `.gitignore` 忽略，WeChatDataAnalysis 安装包体积大、不适合进 git。需要内嵌 WDA 的全量版，请在自己 Mac 上放好包后本地 `python make_macos.py`（见上）。
-- **下载**：Actions 页 → 对应 run → Artifacts → 下载 `wxcsm-macos.zip`（内含 `微信客户沟通总结工具安装向导.app` 与 `.dmg`）。在 Mac 上双击 `.app` 即安装向导；或挂`载`.dmg 拖拽到 `Applications`。
-- 工作流需要能写 `.github/workflows/` 的 token 权限（classic PAT 需勾选 `workflow` 作用域）。
-- **CI 偶发「预执行期失败」**：表现为 run 几秒内结束、`steps=0`、日志 zip 为空（22 字节）。这是 GitHub 托管 macOS runner 调度不到机器，与本项目代码无关，**不要为此改代码**。已知排查结论：workflow YAML 合法、代码可编译、macOS 分钟数未用尽。等其自行恢复后重试即可。
-
-### 分发：该发哪个包？
-
-| 包 | 大小 | 适用 |
-|---|---|---|
-| **完整安装包** | 435 MB | 对方**没装过** WeChatDataAnalysis |
-| **精简版** | 11.6 MB | 对方**已装过** WeChatDataAnalysis |
-
-- **完整安装包**含两个 dmg，收件人必须**按顺序**安装：① `WeChatDataAnalysis-2.3.0-mac-arm64.dmg` → ② `微信客户沟通总结工具安装向导.dmg`。顺序反了首次使用会读不到聊天记录（wxcsm 只读取、不自带解密能力）。
-- **精简版**只含 wxcsm 安装向导。省掉 423MB 的依据：`core/wda_launcher.py` 会自动探测 `/Applications/WeChatDataAnalysis.app` 与 `~/Applications/WeChatDataAnalysis.app`，已装即自动拉起。
-- **分发优先发 `.dmg`，不要打包 `.app` 目录**：`.app` 内部含 Unix 可执行位与符号链接，从 Windows 打包/解压会丢失这些信息，Mac 上很可能打不开；`.dmg` 作为磁盘镜像能完整保留权限结构。
-- **硬件要求**：Apple 芯片（M1/M2/M3 等）。WeChatDataAnalysis 的 macOS 版目前只提供 arm64 版本，Intel Mac 无法使用。
-
-### 备注
-
-- **未签名 .app** 在 Mac 上首次打开可能被 Gatekeeper 拦截：右键「打开」一次放行，或在终端执行
-  `xattr -dr com.apple.quarantine 微信客户沟通总结工具.app` 解除隔离。
-- **卸载**：运行「微信客户沟通总结工具.app」内的「卸载.command」。
-- 构建相关脚本：`make_macos.py`（构建）、`installer_macos.py`（安装向导本体）。
-- 安装包内部实现：向导 `.app` 把业务程序「启动工具.app」以 `Contents/Resources/wxcsm_payload.bin`（XOR 混淆的 zip）形式内嵌，安装时解压到目标 `.app`；改动 Mach-O 会破坏 ad-hoc 签名，故 payload 不放可执行尾部。
-- 仓库与 CI 由一次性 Personal Access Token 配置完成，**建议用完后到 GitHub → Settings → Developer settings → Personal access tokens 撤销该 token**，避免长期泄露。
+- **直接运行**：`python3 app.py`（需带 tkinter 的 python3，macOS 系统自带）。
+- **打包成 .app / .dmg**：`pip3 install --user pyinstaller` 后执行 `python3 make_macos.py`（加 `--dmg` 额外产出 dmg）。
+- **自动构建（无需本机 Mac）**：推送到 GitHub 后由 `.github/workflows/build-macos.yml` 在 macOS runner 上构建，从 Actions Artifact `wxcsm-macos` 下载。
+- **Gatekeeper**：未签名 .app 首次打开会被拦截，右键 →「打开」放行一次，或执行 `xattr -dr com.apple.quarantine 微信客户沟通总结工具.app`。
+- **卸载**：把 .app 从 `应用程序` 拖到废纸篓即可。
+- 详见 `docs/macOS版本说明.md`。
