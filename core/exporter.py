@@ -15,6 +15,19 @@ from openpyxl.utils import get_column_letter
 
 from .models import Summary
 
+# XML 1.0 合法字符(这里只排除控制字符);Excel/xlsx 单元格不能含这些非法字节
+_ILLEGAL_CONTROL = dict.fromkeys(range(32))  # 0x00-0x1f
+for _c in range(0x7F, 0xA0):
+    _ILLEGAL_CONTROL.setdefault(_c, None)  # 0x7f-0x9f 也大多是控制字符
+
+def _clean(value) -> str:
+    """剔除 openpyxl 写入 xlsx 时非法/不可用的控制字符, 避免保存时抛出错误。"""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    return value.translate(_ILLEGAL_CONTROL).replace("\uFFFD", "")
+
 HEADERS: Tuple[str, str, str] = ("客户名称", "时间范围", "总结内容")
 WIDTHS = (26, 26, 92)
 
@@ -85,7 +98,8 @@ def export(summaries: Sequence[Summary], path: str | Path,
     written = 0
     for i, s in enumerate(summaries):
         r = start_row + i
-        for c, value in enumerate((s.customer_name, s.time_range, s.content), start=1):
+        row_values = (_clean(s.customer_name), _clean(s.time_range), _clean(s.content))
+        for c, value in enumerate(row_values, start=1):
             cell = ws.cell(row=r, column=c, value=value)
             cell.font = _BODY_FONT
             cell.border = _BORDER
@@ -94,7 +108,7 @@ def export(summaries: Sequence[Summary], path: str | Path,
                 vertical="center" if c != 3 else "top",
                 wrap_text=(c == 3),
             )
-        ws.row_dimensions[r].height = max(30, min(120, (len(s.content) // 40 + 1) * 20))
+        ws.row_dimensions[r].height = max(30, min(120, (len(_clean(s.content)) // 40 + 1) * 20))
         written += 1
 
     try:
