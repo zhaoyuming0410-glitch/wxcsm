@@ -33,3 +33,5 @@ _privacy_scan.py
 
 # 调试/临时脚本(含本机路径, 不提交)
 /_*.py
+
+push_clean.py
