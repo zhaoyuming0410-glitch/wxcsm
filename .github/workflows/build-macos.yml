@@ -40,7 +40,7 @@ jobs:
           if [ "${{ inputs.with_dmg }}" = "true" ]; then DMG_ARG="--dmg"; fi
           /usr/bin/python3 make_macos.py $DMG_ARG
 
-      - name: 冒烟测试产物(非 wx4: demo 数据源跑通本地总结)
+      - name: "冒烟测试产物（demo 数据源，非 wx4）"
         run: |
           /usr/bin/python3 cli.py run --source demo --all --preset 30d --out /tmp/mac_demo.xlsx
           ls -lh /tmp/mac_demo.xlsx
