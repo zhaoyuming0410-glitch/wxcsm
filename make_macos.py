@@ -63,7 +63,7 @@ def main():
     _log("[2/3] 校验产物包含 tkinter ...")
     found_tk = False
     for dp, _dn, fn in os.walk(app_path):
-        if any("_tkinter" in f or "_tkinter" in d for d in _dn) or \
+        if any("_tkinter" in d for d in _dn) or \
            any("_tkinter" in f for f in fn):
             found_tk = True
             break
