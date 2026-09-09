@@ -29,6 +29,8 @@ jobs:
         run: |
           /usr/bin/python3 -c "import tkinter; print('tkinter OK, Tk', tkinter.TkVersion)"
           /usr/bin/python3 -m pip install --user --quiet pyinstaller
+          # 安装运行依赖(openpyxl/requests/pycryptodome/zstandard), 否则 import 自检/构建会因缺 openpyxl 失败
+          /usr/bin/python3 -m pip install --user --quiet -r requirements.txt
 
       - name: 语法自检(确保改动能 import)
         run: |
