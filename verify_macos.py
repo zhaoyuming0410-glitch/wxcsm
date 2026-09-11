@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -77,6 +78,26 @@ def walk_entries(root: Path):
             yield p, islink, isdir
 
 
+def count_symlinks(root: Path) -> list[Path]:
+    return [p for p, islink, _ in walk_entries(root) if islink]
+
+
+def deps_of(binary: Path) -> list[str]:
+    """otool -L 列出 binary 依赖的库路径(去掉版本后缀)。"""
+    rc, out = run(["otool", "-L", str(binary)])
+    if rc != 0:
+        return []
+    deps = []
+    for ln in out.splitlines()[1:]:
+        ln = ln.strip()
+        if not ln:
+            continue
+        dep = ln.split(" (compatibility")[0].strip()
+        if dep and not dep.startswith("/usr/lib/") and not dep.startswith("/System/"):
+            deps.append(dep)
+    return deps
+
+
 # ---------------------------------------------------------------- .app 校验
 
 def verify_app(app: Path) -> None:
@@ -91,6 +112,7 @@ def verify_app(app: Path) -> None:
 
     # Info.plist
     plist = app / "Contents" / "Info.plist"
+    pl = None
     if plist.is_file():
         ok("Info.plist 存在")
         if sys.platform == "darwin":
@@ -99,6 +121,11 @@ def verify_app(app: Path) -> None:
                 ok("Info.plist 格式合法", out.strip().splitlines()[-1] if out.strip() else "")
             else:
                 fail("Info.plist 格式非法", out.strip()[:200])
+        try:
+            with open(plist, "rb") as f:
+                pl = plistlib.load(f)
+        except Exception as e:  # noqa: BLE001
+            warn("Info.plist 可解析", str(e)[:120])
     else:
         fail("Info.plist 存在", "缺失")
 
@@ -119,10 +146,48 @@ def verify_app(app: Path) -> None:
     else:
         fail("主可执行文件有执行权限", "无 x 位 —— 解压/传输过程丢了权限位")
 
+    # Info.plist 关键键与实际产物是否一致
+    if pl:
+        exe_decl = pl.get("CFBundleExecutable")
+        if exe_decl == exe.name:
+            ok("CFBundleExecutable 与实际二进制一致", exe_decl)
+        elif exe_decl:
+            fail("CFBundleExecutable 与实际二进制一致", f"声明 {exe_decl}, 实为 {exe.name}")
+        else:
+            fail("CFBundleExecutable 已设置", "缺失 —— 双击可能无法启动")
+        bid = pl.get("CFBundleIdentifier") or ""
+        if not bid:
+            fail("CFBundleIdentifier 已设置", "缺失 —— 双击可能无法启动")
+        elif "yourcompany" in bid.lower() or "example" in bid.lower():
+            fail("CFBundleIdentifier 已设置", f"占位值: {bid!r}")
+        elif not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", bid) or "." not in bid:
+            fail("CFBundleIdentifier 格式为反向 DNS(ASCII)",
+                 f"{bid!r} —— 应为 com.example.app 形式。"
+                 "中文/非 ASCII 标识符不符合 Apple 规范(给 PyInstaller 传 --osx-bundle-identifier)")
+        else:
+            ok("CFBundleIdentifier 为反向 DNS 标识符", bid)
+        if pl.get("LSMinimumSystemVersion"):
+            ok("LSMinimumSystemVersion 已声明", str(pl["LSMinimumSystemVersion"]))
+
+    # 架构: 必须与 runner 架构兼容(Apple silicon 上需 arm64 或 universal)
+    if sys.platform == "darwin":
+        rc, out = run(["lipo", "-archs", str(exe)])
+        archs = out.strip().split() if rc == 0 and out.strip() else []
+        host = os.uname().machine
+        if archs:
+            if host in archs:
+                ok("二进制架构与宿主兼容", f"{' '.join(archs)} (host {host})")
+            elif "x86_64" in archs and host == "arm64":
+                warn("二进制架构与宿主兼容", f"仅 {' '.join(archs)}, 需 Rosetta 才能跑")
+            else:
+                fail("二进制架构与宿主兼容", f"{' '.join(archs)} 不含 host {host}")
+        else:
+            warn("二进制架构", "lipo 未能识别")
+
     # 符号链接(关键: Windows 解压会丢)
-    links = [p for p, islink, _ in walk_entries(app) if islink]
+    links = count_symlinks(app)
     if links:
-        ok(f"包内符号链接完好", f"共 {len(links)} 个, 如 {links[0].relative_to(app)}")
+        ok("包内符号链接完好", f"共 {len(links)} 个, 如 {links[0].relative_to(app)}")
     else:
         fail("包内符号链接完好", "一个都没有 —— 典型是 zip 经非 macOS 系统解压丢了链接, "
                                  "这会破坏 Python3.framework 导致无法启动")
@@ -146,33 +211,30 @@ def verify_app(app: Path) -> None:
         fail("_tkinter 已内嵌", "包内找不到 _tkinter —— 启动会报找不到 tk")
 
     # 动态库依赖能否在包内解析
+    # 主二进制(PyInstaller bootloader)通常只链系统库, 真正要看的是 Python 框架二进制。
     if sys.platform == "darwin":
-        rc, out = run(["otool", "-L", str(exe)])
-        if rc != 0:
-            warn("otool -L 主二进制", out.strip()[:150])
-        else:
-            deps = []
-            for ln in out.splitlines()[1:]:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                dep = ln.split(" (compatibility")[0].strip()
-                if dep:
-                    deps.append(dep)
-            # 系统库之外的依赖, basename 应能在包内找到
-            bundle_names = {p.name for p, _, _ in walk_entries(app)}
-            missing = []
-            for d in deps:
-                if d.startswith(("/usr/lib/", "/System/")):
-                    continue
+        targets = [exe]
+        vers = fw / "Versions"
+        if vers.is_dir():
+            for v in vers.iterdir():
+                cand = v / "Python3"
+                if cand.is_file():
+                    targets.append(cand)
+        bundle_names = {p.name for p, _, _ in walk_entries(app)}
+        checked = 0
+        missing: list[str] = []
+        for t in targets:
+            for d in deps_of(t):
+                checked += 1
                 base = os.path.basename(d)
                 if base and base not in bundle_names:
-                    missing.append(d)
-            if missing:
-                fail("非系统动态库依赖均可解析", "包内找不到: " + ", ".join(missing[:5]))
-            else:
-                locals_ = [d for d in deps if not d.startswith(("/usr/lib/", "/System/"))]
-                ok("非系统动态库依赖均可解析", f"检查 {len(locals_)} 项")
+                    missing.append(f"{t.name} -> {d}")
+        if missing:
+            fail("非系统动态库依赖均可解析", "包内找不到: " + "; ".join(missing[:4]))
+        elif checked == 0:
+            ok("非系统动态库依赖均可解析", "已检查的对象只依赖系统库")
+        else:
+            ok("非系统动态库依赖均可解析", f"共 {checked} 项均能在包内找到")
     else:
         warn("动态库依赖检查", "非 macOS, 跳过 otool")
 
@@ -222,15 +284,27 @@ def verify_dmg(dmg: Path, app_name: str, require: bool = False) -> None:
     ok("挂载 .dmg 成功")
     mnt = Path("/tmp/wxcsm_dmg_mnt")
     try:
+        # 拖拽安装落点: 卷根下的 Applications 应是符号链接(/Applications), 而非实体空目录
+        alink = mnt / "Applications"
+        if alink.is_symlink():
+            ok("卷根 Applications 是指向 /Applications 的符号链接", os.readlink(alink))
+        elif alink.exists():
+            fail("卷根 Applications 是符号链接",
+                 "是实体目录 —— 用户往只读镜像里拖 .app 会失败(应 os.symlink('/Applications'))")
+        else:
+            warn("卷根 Applications", "不存在(不影响使用, 但不能直接拖拽安装)")
+
         apps = [p for p in mnt.iterdir() if p.suffix == ".app"]
         if apps:
             inner = apps[0]
             ok("挂载卷内含 .app", inner.name)
-            ilinks = [p for p, islink, _ in walk_entries(inner) if islink]
+            ilinks = count_symlinks(inner)
             if ilinks:
                 ok("镜像内 .app 符号链接完好", f"{len(ilinks)} 个")
             else:
-                fail("镜像内 .app 符号链接完好", "一个都没有")
+                fail("镜像内 .app 符号链接完好",
+                     "一个都没有 —— 打包时符号链接被解引用展开(检查 make_macos.py 的 "
+                     "copytree 是否漏了 symlinks=True)")
             inner_exe = inner / "Contents" / "MacOS" / inner.stem
             if inner_exe.is_file() and os.access(inner_exe, os.X_OK):
                 ok("镜像内 .app 主可执行文件可执行")

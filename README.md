@@ -228,7 +228,7 @@ macOS 版由 Windows 开发机上完成兼容化与静态/导入自检。**CI �
 
 - **直接运行**：`python3 app.py`（需带 tkinter 的 python3，macOS 系统自带）。
 - **打包成 .app / .dmg**：`pip3 install --user pyinstaller` 后执行 `python3 make_macos.py`（加 `--dmg` 额外产出 dmg）。
-- **校验产物**：`python3 verify_macos.py`（可选 `--require-dmg`、`--no-launch`）。会检查 `.app` 内符号链接与权限位是否完好、非系统动态库依赖能否解析、`.dmg` 能否 `hdiutil verify`/挂载、`mac_wx4` 在真 Darwin 上能否 import 且注册进数据源列表，并尝试拉起 `.app` 观察是否秒退。
+- **校验产物**：`python3 verify_macos.py`（可选 `--require-dmg`、`--no-launch`）。会检查 `.app` 内符号链接与权限位是否完好、`CFBundleExecutable`/`CFBundleIdentifier` 是否正确（bundle id 须为反向 DNS 的 ASCII 形式）、二进制架构是否与宿主兼容、非系统动态库依赖能否解析、`.dmg` 能否 `hdiutil verify`/挂载且卷根 `Applications` 是软链、`mac_wx4` 在真 Darwin 上能否 import 且注册进数据源列表，并尝试拉起 `.app` 观察是否秒退。
 - **自动构建 + 自动校验（无需本机 Mac）**：推送到 GitHub 后由 `.github/workflows/build-macos.yml` 在 macOS runner 上构建并校验，从 Actions Artifact `wxcsm-macos` 下载。
 - **下载物怎么选（重要）**：选 **`.dmg`** —— 它是自包含磁盘映像，符号链接与权限位都完好。Artifact 里的东西会被打包成 zip，而 **zip 不保留符号链接/权限位**，所以不要用从 zip 里解出的 `.app` 目录（会启动失败）。若需要 `.app` 本体，用同一 artifact 里的 `微信客户沟通总结工具.app.tar.gz`（tar 保留符号链接）。
 - **Gatekeeper**：未签名 .app 首次打开会被拦截，右键 →「打开」放行一次，或执行 `xattr -dr com.apple.quarantine 微信客户沟通总结工具.app`。
