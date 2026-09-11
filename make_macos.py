@@ -26,6 +26,10 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "微信客户沟通总结工具"
+# 反向 DNS 形式的 bundle id(ASCII)。必须显式传给 PyInstaller:
+# 否则 PyInstaller 默认拿 --name 当 CFBundleIdentifier, 于是变成中文名,
+# 不符合 Apple 规范(会影响 LaunchServices / 偏好存储 / 公证)。
+BUNDLE_ID = "com.fenbeitong.wxcsm"
 OUT_DIR = os.path.join(HERE, "dist_mac")
 
 
@@ -48,6 +52,7 @@ def main():
           "--noconfirm", "--clean",
           "--windowed",
           "--name", APP_NAME,
+          "--osx-bundle-identifier", BUNDLE_ID,
           "--distpath", OUT_DIR,
           "--workpath", os.path.join(OUT_DIR, "build"),
           "--specpath", os.path.join(OUT_DIR, "spec"),
@@ -77,8 +82,20 @@ def main():
         # 用 hdiutil 把 .app 包进 dmg; 便于拖拽安装。
         staging = os.path.join(OUT_DIR, "_dmg_staging")
         shutil.rmtree(staging, ignore_errors=True)
-        os.makedirs(os.path.join(staging, "Applications"), exist_ok=True)
-        shutil.copytree(app_path, os.path.join(staging, os.path.basename(app_path)))
+        os.makedirs(staging, exist_ok=True)
+        # copytree 必须显式 symlinks=True。
+        # 默认 symlinks=False 会把符号链接"解引用"成实体副本, 于是 Python3.framework 的
+        # Versions/Current 等软链被展开成重复目录 —— dmg 里的 .app 结构被破坏且体积虚增。
+        shutil.copytree(app_path, os.path.join(staging, os.path.basename(app_path)),
+                        symlinks=True)
+        # 拖拽安装的落点要做成指向 /Applications 的符号链接。
+        # 若建成普通空目录, 用户把 .app 拖进去会尝试写入只读镜像而失败。
+        lnk = os.path.join(staging, "Applications")
+        try:
+            if not os.path.islink(lnk):
+                os.symlink("/Applications", lnk)
+        except OSError as e:
+            _log(f"  ⚠️ 未能创建 Applications 软链: {e}")
         _run(["hdiutil", "create", "-volname", APP_NAME, "-srcfolder", staging,
               "-ov", "-format", "UDZO", dmg])
         shutil.rmtree(staging, ignore_errors=True)

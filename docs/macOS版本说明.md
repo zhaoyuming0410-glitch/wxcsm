@@ -51,13 +51,16 @@ python3 verify_macos.py --no-launch     # 跳过启动冒烟
 
 | 分组 | 检查项 |
 |---|---|
-| `.app` 结构 | Info.plist 合法（`plutil -lint`）、主可执行文件存在且有 `x` 位、**包内符号链接完好**、`Python3.framework/Versions/Current` 是软链、`_tkinter` 已内嵌 |
-| 依赖 | `otool -L` 主二进制，非系统动态库能否在包内找到（缺 dylib = 双击闪退的典型原因） |
-| `.dmg` | UDIF 签名（`koly`）、`hdiutil verify`、挂载、镜像内 `.app` 符号链接、卸载 |
+| `.app` 结构 | Info.plist 存在且合法（`plutil -lint`）、`CFBundleExecutable` 与实际二进制一致、`CFBundleIdentifier` 是反向 DNS 的 ASCII 标识符、主可执行文件存在且有 `x` 位、**包内符号链接完好**、`Python3.framework/Versions/Current` 是软链、`_tkinter` 已内嵌 |
+| 架构 | `lipo -archs` 与宿主架构兼容（Apple silicon 上需 arm64 或 universal） |
+| 依赖 | `otool -L` 主二进制与 `Python3.framework` 二进制，非系统动态库能否在包内找到（缺 dylib = 双击闪退的典型原因） |
+| `.dmg` | UDIF 签名（`koly`）、`hdiutil verify`、挂载、**卷根 `Applications` 是否指向 `/Applications` 的符号链接**、镜像内 `.app` 符号链接、卸载 |
 | `mac_wx4` 自检 | 真 Darwin 上各子模块可 import、`IS_MAC` 为真、数据源注册表含 `wx4mac`、`detect` 优雅退出、密码学库可用 |
 | 启动冒烟 | 拉起 `.app` 观察是否 10 秒内秒退；区分「缺库/缺模块崩溃」（判失败）与「无图形会话」（仅告警） |
 
 > 为什么专门查符号链接：GitHub Actions 的 artifact 是 **zip**，而 **zip 不保留符号链接与权限位**。若把 artifact 里的 `.app` 目录解压到非 macOS 系统，`Python3.framework/Versions/Current` 这类软链会被展开成副本，应用会启动失败。`verify_macos.py` 会把这种情况判为硬失败。
+>
+> 这套校验已经实际抓到过两个打包缺陷（现均已修复）：打 `.dmg` 时 `shutil.copytree` 漏了 `symlinks=True`，把符号链接解引用展开，导致镜像里的 `.app` 结构被破坏；以及卷根 `Applications` 被建成了实体空目录，用户往只读镜像里拖拽必然失败。
 
 ## 四、用 GitHub Actions 自动构建（无需本机 Mac）
 
