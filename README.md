@@ -172,9 +172,8 @@ wxcsm/
 ├── make_installer.py     Windows 安装包构建（产出 .exe Setup）
 ├── installer_main.py     Windows 安装向导本体
 ├── make_macos.py         macOS 打包脚本（PyInstaller 产出 .app，可选 .dmg；须在 Mac / CI 运行）
-├── .github/workflows/build-macos.yml   GitHub Actions 在 macOS runner 上自动构建 .app/.dmg
-├── push_via_api.py       （开发辅助）受限网络下用 API 上传仓库，替代 git push
-├── wait_download.py      （开发辅助）监控 Actions 构建并下载 artifact
+├── verify_macos.py       macOS 产物校验（.app 结构/符号链接/依赖、.dmg 校验、mac_wx4 自检、启动冒烟）
+├── .github/workflows/build-macos.yml   GitHub Actions 在 macOS runner 上构建并校验 .app/.dmg
 └── core/
     ├── models.py         数据模型
     ├── pipeline.py       业务流水线（GUI 与 CLI 共用）
@@ -223,13 +222,15 @@ wxcsm 的 GUI 与引擎（`app.py` / `cli.py` / `core/`）基于 tkinter，本�
 - **Windows**：当前主要交付形态。双击安装向导即可使用，支持 4.x 加密库直读（wx4）、导入文件、已解密库等数据源。
 - **macOS**：同样的 GUI 与引擎基于 tkinter 可运行。macOS 端**不支持 wx4「直读本机微信」数据源**（其为 Windows 微信 4.x 专属机制），但内置样例 / 导入文件 / 已解密库三种数据源以及总结、AI、Excel 导出均可正常使用。
 
-macOS 版由 Windows 开发机上完成兼容化与静态/导入自检，**未在真实 macOS 微信上端到端验证**；请在 Mac 上构建后实际跑一次确认。取钥与解密（仅 Windows）均由内置纯 Python 实现完成，不依赖任何外部第三方组件。
+macOS 版由 Windows 开发机上完成兼容化与静态/导入自检。**CI 已在真实 macOS runner 上对构建产物做自动化校验**（`.app` 结构/符号链接/动态库依赖、`.dmg` 挂载校验、`mac_wx4` 模块自检、启动冒烟）；但**尚无真实 macOS 微信环境做过端到端取钥解密验证**，需在装好微信的 Mac 上按 `docs/macOS微信直读_真机步骤.md` 实跑一次确认。取钥与解密均由内置纯 Python 实现完成，不依赖任何外部第三方组件。
 
 ### macOS 打包与运行
 
 - **直接运行**：`python3 app.py`（需带 tkinter 的 python3，macOS 系统自带）。
 - **打包成 .app / .dmg**：`pip3 install --user pyinstaller` 后执行 `python3 make_macos.py`（加 `--dmg` 额外产出 dmg）。
-- **自动构建（无需本机 Mac）**：推送到 GitHub 后由 `.github/workflows/build-macos.yml` 在 macOS runner 上构建，从 Actions Artifact `wxcsm-macos` 下载。
+- **校验产物**：`python3 verify_macos.py`（可选 `--require-dmg`、`--no-launch`）。会检查 `.app` 内符号链接与权限位是否完好、非系统动态库依赖能否解析、`.dmg` 能否 `hdiutil verify`/挂载、`mac_wx4` 在真 Darwin 上能否 import 且注册进数据源列表，并尝试拉起 `.app` 观察是否秒退。
+- **自动构建 + 自动校验（无需本机 Mac）**：推送到 GitHub 后由 `.github/workflows/build-macos.yml` 在 macOS runner 上构建并校验，从 Actions Artifact `wxcsm-macos` 下载。
+- **下载物怎么选（重要）**：选 **`.dmg`** —— 它是自包含磁盘映像，符号链接与权限位都完好。Artifact 里的东西会被打包成 zip，而 **zip 不保留符号链接/权限位**，所以不要用从 zip 里解出的 `.app` 目录（会启动失败）。若需要 `.app` 本体，用同一 artifact 里的 `微信客户沟通总结工具.app.tar.gz`（tar 保留符号链接）。
 - **Gatekeeper**：未签名 .app 首次打开会被拦截，右键 →「打开」放行一次，或执行 `xattr -dr com.apple.quarantine 微信客户沟通总结工具.app`。
 - **卸载**：把 .app 从 `应用程序` 拖到废纸篓即可。
 - 详见 `docs/macOS版本说明.md`。
