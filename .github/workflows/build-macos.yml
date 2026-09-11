@@ -2,11 +2,20 @@
 # 触发:
 #   1) push 到 main/master; 或
 #   2) Actions 页手动 Run workflow(可选打 .dmg)。
-# 产物: Actions Artifact(名 wxcsm-macos)里下载 .app / .dmg。
+# 产物: Actions Artifact(名 wxcsm-macos)里下载 .dmg / .app.tar.gz。
+#
+# 校验(verify_macos.py, 在真 macOS 上跑):
+#   · .app 结构: Info.plist / 可执行权限位 / 符号链接 / _tkinter / 动态库依赖可解析
+#   · .dmg: UDIF 签名 / hdiutil verify / 挂载 / 镜像内 .app 符号链接 / 卸载
+#   · mac_wx4 自检: 真 Darwin 上 import / IS_MAC / 注册表含 wx4mac / detect 正常退出 / 密码学库可用
+#   · 启动冒烟: 拉起 .app 观察是否秒退(区分"缺库崩溃"与"环境无显示")
+#
+# 关于分发格式: artifact 的 zip 不保留符号链接与权限位(经 Windows 解压会破坏 .app),
+#   故额外用 tar 打包 .app.tar.gz(tar 保留符号链接), 并以 .dmg 作为首选分发格式。
 #
 # 说明: 本工具 wx4「直读本机微信(Windows 4.x)」为 Windows 专属; macOS 版支持
 #       demo / 导入文件 / 已解密库 数据源 + 本地/AI 总结 + Excel 导出。
-#       macOS 微信数据直读受限于 Runner 无微信, 需在真机另测。
+#       macOS 微信数据直读需真机(装有微信并登录), Runner 上只做模块级自检。
 name: Build macOS
 
 on:
@@ -47,12 +56,26 @@ jobs:
           /usr/bin/python3 cli.py run --source demo --all --preset 30d --out /tmp/mac_demo.xlsx
           ls -lh /tmp/mac_demo.xlsx
 
+      - name: "校验构建产物（.app 结构 / 符号链接 / 依赖 / .dmg / mac_wx4 自检 / 启动冒烟）"
+        run: |
+          if [ "${{ inputs.with_dmg }}" = "true" ]; then
+            /usr/bin/python3 verify_macos.py --require-dmg
+          else
+            /usr/bin/python3 verify_macos.py
+          fi
+
+      - name: "打包 .app 为 tar.gz（保留符号链接与权限，避免 zip 传输损坏）"
+        run: |
+          cd dist_mac
+          tar -czf "微信客户沟通总结工具.app.tar.gz" "微信客户沟通总结工具.app"
+          ls -lh *.tar.gz *.dmg 2>/dev/null || ls -lh
+
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: wxcsm-macos
           path: |
-            dist_mac/*.app
             dist_mac/*.dmg
+            dist_mac/*.app.tar.gz
           if-no-files-found: warn
           retention-days: 30
