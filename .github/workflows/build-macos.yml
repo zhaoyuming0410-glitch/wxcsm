@@ -67,7 +67,7 @@ jobs:
       - name: "打包 .app 为 tar.gz（保留符号链接与权限，避免 zip 传输损坏）"
         run: |
           cd dist_mac
-          tar -czf "微信客户沟通总结工具.app.tar.gz" "微信客户沟通总结工具.app"
+          tar -czf "绿泡泡聊天记录总结.app.tar.gz" "绿泡泡聊天记录总结.app"
           ls -lh *.tar.gz *.dmg 2>/dev/null || ls -lh
 
       - name: 上传产物

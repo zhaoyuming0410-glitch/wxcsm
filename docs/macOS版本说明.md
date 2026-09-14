@@ -33,11 +33,11 @@ python3 cli.py run --source demo --all --preset 30d --out ~/Desktop/总结.xlsx 
 
 ```bash
 pip3 install --user pyinstaller
-python3 make_macos.py            # 产出 dist_mac/微信客户沟通总结工具.app
+python3 make_macos.py            # 产出 dist_mac/绿泡泡聊天记录总结.app
 python3 make_macos.py --dmg      # 额外打 .dmg 便于拖拽安装
 ```
 
-产物：`dist_mac/微信客户沟通总结工具.app`（可选 `.dmg`）。未签名 app 首次打开会被 Gatekeeper 拦，右键 → 打开 放行一次即可。
+产物：`dist_mac/绿泡泡聊天记录总结.app`（可选 `.dmg`）。未签名 app 首次打开会被 Gatekeeper 拦，右键 → 打开 放行一次即可。
 
 打包后可自行校验产物（建议每次改动后跑一次）：
 
@@ -69,7 +69,7 @@ python3 verify_macos.py --no-launch     # 跳过启动冒烟
 2. GitHub 自动在 macOS runner 上：装依赖 → import 自检 → 构建 `.app`（可选 `.dmg`）→ demo 数据源冒烟 → **跑 `verify_macos.py` 校验产物** → 打包 `.app.tar.gz`；
 3. Actions 页的 Artifact `wxcsm-macos` 里下载。
 
-**下载物怎么选（重要）**：优先用 **`.dmg`** —— 它是自包含磁盘映像，符号链接与权限位都完好，双击即可拖入「应用程序」。若确实需要 `.app` 本体，请用同一 artifact 里的 **`微信客户沟通总结工具.app.tar.gz`**（tar 保留符号链接），**不要**用从 zip 里解出来的 `.app` 目录。
+**下载物怎么选（重要）**：优先用 **`.dmg`** —— 它是自包含磁盘映像，符号链接与权限位都完好，双击即可拖入「应用程序」。若确实需要 `.app` 本体，请用同一 artifact 里的 **`绿泡泡聊天记录总结.app.tar.gz`**（tar 保留符号链接），**不要**用从 zip 里解出来的 `.app` 目录。
 
 > 校验步骤放在上传产物**之前**：一旦校验不过，本次构建即失败且不会产出 artifact，避免把坏包发出去。
 

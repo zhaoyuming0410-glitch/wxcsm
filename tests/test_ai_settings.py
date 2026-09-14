@@ -23,11 +23,11 @@ def _build_demo_bundle() -> ChatBundle:
     """一段极简、但包含我方/客户双方发言的沟通样本，足以触发总结。"""
     msgs = [
         Message(ts=__import__("datetime").datetime(2026, 8, 20, 10, 1),
-                sender="赵禹铭", text="您好，关于 SSO 对接我们这边想本月底完成联调。", is_self=True),
+                sender="李四", text="您好，关于 SSO 对接我们这边想本月底完成联调。", is_self=True),
         Message(ts=__import__("datetime").datetime(2026, 8, 20, 10, 5),
                 sender="客户", text="好的，我们后端接口这周能给您白名单，字段映射表稍后发您。", is_self=False),
         Message(ts=__import__("datetime").datetime(2026, 8, 21, 14, 30),
-                sender="赵禹铭", text="字段映射已收到，配置完成，预计明天生效。", is_self=True),
+                sender="李四", text="字段映射已收到，配置完成，预计明天生效。", is_self=True),
         Message(ts=__import__("datetime").datetime(2026, 8, 22, 9, 12),
                 sender="客户", text="辛苦，另外希望报销导出能支持按利润中心拆分，有没有办法？", is_self=False),
     ]

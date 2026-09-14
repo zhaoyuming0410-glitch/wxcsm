@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""微信客户沟通记录提取与总结工具 —— 图形界面。
+"""绿泡泡聊天记录总结 —— 图形界面。
 
 面向对象：完全没有编程与命令行经验的业务人员。
 因此界面遵守三条铁律：
@@ -8,7 +8,7 @@
   3. 关键操作可撤销、可预览、可人工修订后再导出。
 
 一个刻意的设计：勾选状态与搜索框解耦。
-  业务人员的真实操作是"搜张总→勾上→搜蔚蓝→再勾上→一起生成"。
+  业务人员的真实操作是"搜张总→勾上→搜丙丁→再勾上→一起生成"。
   若沿用普通列表的多选，第二次搜索会清空第一次的勾选，用户会反复抓狂。
   所以这里用「勾选列 + 独立的已选集合」，搜索只影响显示，绝不影响已勾选的对象。
 """
@@ -33,13 +33,31 @@ import webbrowser
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core import config, pipeline, workbuddy_models
-from core.models import Contact, Summary, KIND_LABEL
+from core import __version__, config, name_library, pipeline, workbuddy_models
+from core.models import (
+    QA_KINDS, QA_STATUS_DONE, QA_STATUS_PENDING, QA_STATUS_PROMISED, KIND_LABEL, Contact,
+    QaItem, Summary,
+)
+from core.name_library import merge_names, read_columns, split_names
+from core.self_discover import Candidate, suggest_self_members
 from core.sources import SourceError, choices, REGISTRY
 from core.wx4 import keyring, locate
 from core.wx4.errors import KeyNotFoundError, WechatNotRunningError
 
-APP_TITLE = "微信客户沟通记录提取与总结工具"
+APP_TITLE = "绿泡泡聊天记录总结"
+
+
+def _build_tag() -> str:
+    """标出当前跑的是打包版还是源码版。
+
+    为什么需要：打包出来的 exe 是**某个时间点的快照**，改了源码不重新打包，
+    双击 exe 看到的还是旧界面（而且旧包不会报错、不会提示，就是"功能不见了"）。
+    标题栏上写清楚版本号和来源，这类问题一眼就能判断，不用再靠猜。
+    """
+    return "打包版" if getattr(sys, "frozen", False) else "源码版"
+
+
+APP_TITLE_FULL = f"{APP_TITLE}  v{__version__}（{_build_tag()}）"
 # 字体按平台自适配：Windows 用微软雅黑；macOS 用苹方（PingFang SC），缺失时回退系统默认
 if sys.platform == "darwin":
     FONT = ("PingFang SC", 9)
@@ -55,6 +73,9 @@ CLR_SEL = "#DCE9F7"
 CLR_MUTE = "#6B7280"
 CLR_OK = "#137333"
 CLR_ERR = "#B3261E"
+# 与 Excel 里的标色保持一致：未答复=红、我方待办=橙
+CLR_WARN = "#C00000"
+CLR_PROMISE = "#BF6000"
 RENDER_LIMIT = 2000          # 列表单次渲染上限：超过则只显示前 N 条并提示用搜索缩小（避免万级数据卡死）
 
 
@@ -92,7 +113,7 @@ def parse_curl_config(text: str) -> tuple:
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(APP_TITLE)
+        self.title(APP_TITLE_FULL)
         # 高 DPI 缩放下,固定 1180x830 会被 Windows 放大后超出可视区, 导致底部
         # "结果区/导出到Excel"被推出屏幕。开启 DPI 感知并自适应屏幕, 保证全屏可见。
         self._enable_dpi_awareness()
@@ -105,6 +126,10 @@ class App(tk.Tk):
         self.visible: List[Contact] = []    # 实际渲染的行（受 RENDER_LIMIT 限制）
         self.picked: set[str] = set()
         self.summaries: List[Summary] = []
+        self.qa_items: List[QaItem] = []
+        # 「我方成员」勾选缓存：名字 -> 是否勾选。跨次打开「选择我方成员」窗口时保留，
+        # 免得用户挑了一轮、关掉再开又得重挑。
+        self.self_candidates: List = []
         self.msg_q: "queue.Queue[tuple]" = queue.Queue()
         self.busy = False
         # 主列表 类型筛选 + 排序 状态 (_build_left 会创建 var_kind)
@@ -118,8 +143,11 @@ class App(tk.Tk):
         self._build_ui()
         self._on_source_change()
         self._apply_preset("7d")
-        self.after(120, self._drain_queue)
+        self._drain_id: Optional[str] = self.after(120, self._drain_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 挂在 <Destroy> 上而不是只写在 _on_close 里：销毁窗口的路径不止"点关闭"
+        # 一条（程序内部也会 destroy），哪条路径都得把定时器撤掉。
+        self.bind("<Destroy>", self._on_destroy)
 
     # ================= 窗口适配(高 DPI 缩放) =================
     @staticmethod
@@ -199,6 +227,13 @@ class App(tk.Tk):
         self._build_right(root)
         self._build_action(root)
         self._build_result(root)
+        # 关键：窗口比内容矮时，grid 会按 weight 压缩第 0 行，而右侧列的区块压不下去
+        # 就会向下溢出、盖住执行行与结果区（实测 ⑤ 的底部越界过 75px）。
+        # 给第 0 行设 minsize 后它不再被压到需求高度以下，缺口全部由第 2 行（结果区）
+        # 承担——结果表格本来就是可滚动的，压缩它无害。
+        self.update_idletasks()
+        root.rowconfigure(0, minsize=self.frm_right.winfo_reqheight())
+        self._update_format_ui()      # 结果区建好后再按当前输出形式刷一次可用状态
 
     # ---------- 左：数据源 + 聊天对象 ----------
     def _build_left(self, root) -> None:
@@ -229,16 +264,25 @@ class App(tk.Tk):
         self.ent_path.grid(row=2, column=1, sticky="ew", padx=4)
         self.btn_path.grid(row=2, column=2, sticky="e")
 
-        # 我方标识名：导入源（真实姓名场景无「我方」标记）与解密数据库源（群聊 is_sender 偶尔归错人）都用它
+        # 我方成员：群聊里同事的发言也要算「我方」，否则问答清单的答复会大面积
+        # 显示"未答复"；导入源（真实姓名场景无「我方」标记）与解密数据库源
+        # （群聊 is_sender 偶尔归错人）也用它。
         self.frm_self = ttk.Frame(f1)
         self.frm_self.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self.frm_self.columnconfigure(1, weight=1)
-        ttk.Label(self.frm_self, text="我方标识名：").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.frm_self, text="我方成员：").grid(row=0, column=0, sticky="w")
         self.var_self_names = tk.StringVar(value=", ".join(self.cfg.get("self_names") or []))
         ttk.Entry(self.frm_self, textvariable=self.var_self_names).grid(
             row=0, column=1, sticky="ew", padx=4)
-        ttk.Label(self.frm_self, text="（多个逗号分隔；数据库源用它校正群聊归错人，并统一显示你的名字）",
-                  style="Hint.TLabel").grid(row=0, column=2)
+        self.btn_self_pick = ttk.Button(self.frm_self, text="选择…", width=8,
+                                        command=self._open_self_picker)
+        self.btn_self_pick.grid(row=0, column=2, sticky="e")
+        ttk.Label(
+            self.frm_self,
+            text="填你和同事的名字（逗号分隔）。群聊里不填会把同事的答复当成客户发言，"
+                 "问答清单会大面积显示「未答复」。点「选择…」可从聊天记录里挑人。",
+            style="Hint.TLabel", wraplength=520, justify="left").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         bar = ttk.Frame(f1)
         bar.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
@@ -342,6 +386,7 @@ class App(tk.Tk):
         right = ttk.Frame(root)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
+        self.frm_right = right      # _build_ui 要拿它的需求高度给第 0 行设 minsize
 
         # ③ 时间范围
         f3 = ttk.Labelframe(right, text=" ③ 设置提取时间范围 ", padding=10)
@@ -359,53 +404,103 @@ class App(tk.Tk):
 
         self.var_start = tk.StringVar()
         self.var_end = tk.StringVar()
-        ttk.Label(f3, text="开始日期：").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Entry(f3, textvariable=self.var_start, width=14).grid(row=1, column=1, sticky="w")
-        ttk.Label(f3, text="结束日期：").grid(row=2, column=0, sticky="w", pady=2)
-        ttk.Entry(f3, textvariable=self.var_end, width=14).grid(row=2, column=1, sticky="w")
-        ttk.Label(f3, text="格式 2026-08-01，含首尾两天。所选每个对象各生成一篇总结。",
-                  style="Hint.TLabel", wraplength=330, justify="left"
+        # 起止日期并成一行：纵向空间要留给 ⑥ 结果区，实测每省一行表格就多 25px
+        drow = ttk.Frame(f3)
+        drow.grid(row=1, column=0, columnspan=4, sticky="w")
+        ttk.Label(drow, text="开始：").pack(side="left")
+        ttk.Entry(drow, textvariable=self.var_start, width=12).pack(side="left")
+        ttk.Label(drow, text="　结束：").pack(side="left")
+        ttk.Entry(drow, textvariable=self.var_end, width=12).pack(side="left")
+        ttk.Label(f3, text="格式 2026-08-01，含首尾两天。",
+                  style="Hint.TLabel", wraplength=460, justify="left"
                   ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-        # ④ 总结方式
-        f4 = ttk.Labelframe(right, text=" ④ 选择总结生成方式 ", padding=10)
-        f4.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        # ④ 生成内容 + 生成方式
+        # 布局上刻意把单选做成「一行选项 + 一行说明」：三个长单选标签堆叠会让本区
+        # 高达 269px，把下面的 ⑤ 挤出分配高度（实测底部越界 75px，与执行行重叠）。
+        # 说明随选择动态变化，信息一点没少，还给 ⑥ 结果区腾出了高度。
+        f4 = ttk.Labelframe(right, text=" ④ 选择生成什么、怎么生成 ", padding=10)
+        f4.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         f4.columnconfigure(1, weight=1)
+
+        # 4.1 生成内容（输出形式）——两张表写进同一个 Excel 的两张 sheet，可一次跑完
+        ttk.Label(f4, text="生成内容：").grid(row=0, column=0, sticky="nw")
+        self.var_format = tk.StringVar(
+            value=self.cfg.get("output_format", "both") or "both")
+        fmt_box = ttk.Frame(f4)
+        fmt_box.grid(row=0, column=1, sticky="w")
+        self._FMT_SHORT = {"both": "两者都要", "summary": "仅沟通总结",
+                           "qa": "仅问题答复清单"}
+        self._FMT_HINT = {
+            "both": "一次跑完：两张表写进同一个 Excel，互不影响。",
+            "summary": "每个对象一段叙述式沟通总结。",
+            "qa": "客户问题 / 我方答复对照表，含未答复与待跟进。",
+        }
+        for val, _long in pipeline.OUTPUT_FORMATS:
+            ttk.Radiobutton(fmt_box, text=self._FMT_SHORT.get(val, _long), value=val,
+                            variable=self.var_format, command=self._update_format_ui
+                            ).pack(side="left", padx=(0, 12))
+        self.lbl_fmt_hint = ttk.Label(f4, text="", style="Hint.TLabel",
+                                      wraplength=480, justify="left")
+        self.lbl_fmt_hint.grid(row=1, column=1, sticky="w")
+
+        ttk.Separator(f4, orient="horizontal").grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(6, 5))
+
+        # 4.2 生成方式（引擎）——只管文字怎么来，不管生成几张表
+        ttk.Label(f4, text="生成方式：").grid(row=3, column=0, sticky="nw")
         self.var_engine = tk.StringVar(value=self.cfg.get("engine", "auto"))
-        for i, (val, text) in enumerate((
-            ("auto", "智能（优先 AI，不可用时自动改用本地总结）"),
-            ("ai", "仅用 AI 生成（质量最好，需联网与密钥）"),
-            ("offline", "仅用本地生成（不联网、不外发数据）"),
-        )):
-            ttk.Radiobutton(f4, text=text, value=val, variable=self.var_engine
-                            ).grid(row=i, column=0, columnspan=3, sticky="w", pady=1)
+        eng_box = ttk.Frame(f4)
+        eng_box.grid(row=3, column=1, sticky="w")
+        self._ENG_SHORT = {"auto": "智能", "ai": "仅 AI", "offline": "仅本地"}
+        self._ENG_HINT = {
+            "auto": "优先用 AI，不可用时自动改用本地，不中断。",
+            "ai": "只用 AI，效果最好；需联网和 API Key。",
+            "offline": "只用本地规则；不联网，记录不外发。",
+        }
+        for val in ("auto", "ai", "offline"):
+            ttk.Radiobutton(eng_box, text=self._ENG_SHORT[val], value=val,
+                            variable=self.var_engine,
+                            command=self._update_engine_hint
+                            ).pack(side="left", padx=(0, 12))
+        self.lbl_eng_hint = ttk.Label(f4, text="", style="Hint.TLabel",
+                                      wraplength=480, justify="left")
+        self.lbl_eng_hint.grid(row=4, column=1, sticky="w")
+
         crow = ttk.Frame(f4)
-        crow.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        ttk.Label(crow, text="总结字数：").pack(side="left")
+        crow.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.lbl_chars = ttk.Label(crow, text="总结字数：")
+        self.lbl_chars.pack(side="left")
         self.var_min = tk.StringVar(value=str(self.cfg.get("min_chars", 50)))
         self.var_max = tk.StringVar(value=str(self.cfg.get("max_chars", 200)))
-        ttk.Entry(crow, textvariable=self.var_min, width=5).pack(side="left")
-        ttk.Label(crow, text=" ~ ").pack(side="left")
-        ttk.Entry(crow, textvariable=self.var_max, width=5).pack(side="left")
-        ttk.Label(crow, text=" 字").pack(side="left")
+        self.ent_min = ttk.Entry(crow, textvariable=self.var_min, width=5)
+        self.ent_min.pack(side="left")
+        self.lbl_chars_mid = ttk.Label(crow, text=" ~ ")
+        self.lbl_chars_mid.pack(side="left")
+        self.ent_max = ttk.Entry(crow, textvariable=self.var_max, width=5)
+        self.ent_max.pack(side="left")
+        self.lbl_chars_end = ttk.Label(crow, text=" 字")
+        self.lbl_chars_end.pack(side="left")
         ttk.Button(crow, text="AI 设置…", command=self._open_ai_settings).pack(side="right")
 
         # 客户阶段（影响总结侧重与段落优先级；留空=按对话关键词自动推断）
         srow_stage = ttk.Frame(f4)
-        srow_stage.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        ttk.Label(srow_stage, text="客户阶段：").pack(side="left")
+        srow_stage.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.lbl_stage = ttk.Label(srow_stage, text="客户阶段：")
+        self.lbl_stage.pack(side="left")
         self.var_stage = tk.StringVar(value=self.cfg.get("customer_stage") or "自动推断")
         self.cbo_stage = ttk.Combobox(
             srow_stage, state="readonly", width=14,
             textvariable=self.var_stage,
             values=["自动推断", "续费期", "实施中", "新签客户", "稳定使用"])
         self.cbo_stage.pack(side="left", padx=(4, 0))
-        ttk.Label(srow_stage, text="（续费期优先保留风险，稳定使用偏进展）",
-                  style="Hint.TLabel").pack(side="left", padx=6)
+        self.lbl_stage_hint = ttk.Label(
+            srow_stage, text="（续费期优先保留风险，稳定使用偏进展）", style="Hint.TLabel")
+        self.lbl_stage_hint.pack(side="left", padx=6)
 
         # ⑤ 导出
         f5 = ttk.Labelframe(right, text=" ⑤ 设置 Excel 保存位置 ", padding=10)
-        f5.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        f5.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         f5.columnconfigure(0, weight=1)
         self.var_export = tk.StringVar(value=self.cfg.get("export_path", ""))
         ttk.Entry(f5, textvariable=self.var_export).grid(row=0, column=0, sticky="ew")
@@ -418,9 +513,9 @@ class App(tk.Tk):
                         variable=self.var_mode).pack(side="left")
         ttk.Radiobutton(mrow, text="覆盖重建", value="overwrite",
                         variable=self.var_mode).pack(side="left", padx=(10, 0))
-        ttk.Label(f5, text="固定三列：客户名称 / 时间范围 / 总结内容。",
+        ttk.Label(f5, text="总结写「客户沟通总结」表，问答清单写另一张表，互不覆盖。",
                   style="Hint.TLabel").grid(row=2, column=0, columnspan=2,
-                                            sticky="w", pady=(6, 0))
+                                            sticky="w", pady=(4, 0))
 
     # ---------- 中：执行区 ----------
     def _build_action(self, root) -> None:
@@ -437,8 +532,22 @@ class App(tk.Tk):
                   ).grid(row=1, column=1, sticky="w", padx=12)
 
     # ---------- 下：结果 ----------
+    # 结果区的列不写死：生成内容不同（沟通总结 / 问题答复清单），要看的列完全不同。
+    # 两套列定义放在这里，_render_results 按当前输出形式切换。
+    SUMMARY_COLS = (
+        ("name", "客户名称", 190, False), ("range", "时间范围", 170, False),
+        ("content", "总结内容", 640, True), ("meta", "字数/方式", 110, False),
+    )
+    QA_COLS = (
+        ("name", "客户名称", 150, False), ("kind", "类型", 62, False),
+        ("atime", "提问时间", 92, False), ("question", "客户问题", 330, True),
+        ("answer", "我方答复/处理", 380, True), ("antime", "答复时间", 92, False),
+        ("status", "状态", 118, False), ("raw", "原始记录", 320, False),
+    )
+
     def _build_result(self, root) -> None:
-        f = ttk.Labelframe(root, text=" ⑥ 总结结果（双击任意一行可人工修订后再导出） ", padding=10)
+        f = ttk.Labelframe(
+            root, text=" ⑥ 结果（双击任意一行可人工修订后再导出） ", padding=10)
         f.grid(row=2, column=0, columnspan=2, sticky="nsew")
         f.columnconfigure(0, weight=1)
         f.rowconfigure(0, weight=1)
@@ -447,29 +556,54 @@ class App(tk.Tk):
         wrap.grid(row=0, column=0, sticky="nsew")
         wrap.columnconfigure(0, weight=1)
         wrap.rowconfigure(0, weight=1)
-        cols = ("name", "range", "content", "meta")
-        self.tv_res = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="browse")
-        for cid, text, w, stretch in (
-            ("name", "客户名称", 190, False), ("range", "时间范围", 170, False),
-            ("content", "总结内容", 640, True), ("meta", "字数/方式", 110, False),
-        ):
-            self.tv_res.heading(cid, text=text)
-            self.tv_res.column(cid, width=w, stretch=stretch, anchor="w")
+        # 问答清单有 8 列，窄屏放不下，配横向滚动条
+        self.tv_res = ttk.Treeview(wrap, columns=[c[0] for c in self.SUMMARY_COLS],
+                                   show="headings", selectmode="browse")
         self.tv_res.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.tv_res.yview)
         sb.grid(row=0, column=1, sticky="ns")
-        self.tv_res.configure(yscrollcommand=sb.set)
-        self.tv_res.bind("<Double-1>", self._edit_summary)
+        self.sb_x = ttk.Scrollbar(wrap, orient="horizontal", command=self.tv_res.xview)
+        self.sb_x.grid(row=1, column=0, sticky="ew")
+        self.tv_res.configure(yscrollcommand=sb.set, xscrollcommand=self.sb_x.set)
+        self.tv_res.bind("<Double-1>", self._edit_row)
 
         brow = ttk.Frame(f)
         brow.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         self.btn_export = ttk.Button(brow, text="导出到 Excel", command=self._export)
         self.btn_export.pack(side="left")
         ttk.Button(brow, text="打开 Excel 文件", command=self._open_export).pack(side="left", padx=6)
-        ttk.Button(brow, text="修订选中总结", command=self._edit_summary).pack(side="left")
+        self.btn_edit = ttk.Button(brow, text="修订选中总结", command=self._edit_row)
+        self.btn_edit.pack(side="left")
         ttk.Button(brow, text="清空结果", command=self._clear_res).pack(side="left", padx=6)
         self.lbl_res = ttk.Label(brow, text="暂无结果", style="Hint.TLabel")
         self.lbl_res.pack(side="right")
+        # 必须在 brow 建好之后调：_apply_result_columns 会改 btn_edit 的文案
+        self._apply_result_columns("both")
+
+    def _result_shape(self) -> str:
+        """当前结果区该按哪种形态展示：qa=问题答复清单，summary=沟通总结。"""
+        fmt = self.var_format.get() if hasattr(self, "var_format") else "both"
+        if fmt == "qa":
+            return "qa"
+        if fmt == "summary":
+            return "summary"
+        # 「两者都要」时：有问答条目就优先显示问答清单（信息量更大，也是新功能），
+        # 两者都有时用户可以切回"仅沟通总结"再看叙述版
+        return "qa" if self.qa_items else "summary"
+
+    def _apply_result_columns(self, shape: str) -> None:
+        cols = self.QA_COLS if shape == "qa" else self.SUMMARY_COLS
+        self._res_shape = shape
+        self.tv_res.configure(columns=[c[0] for c in cols])
+        for cid, text, w, stretch in cols:
+            self.tv_res.heading(cid, text=text)
+            self.tv_res.column(cid, width=w, stretch=stretch, minwidth=60,
+                               anchor="w" if cid in ("content", "question", "answer", "raw")
+                               else "center")
+        self.tv_res.tag_configure("pend", foreground=CLR_WARN)
+        self.tv_res.tag_configure("promise", foreground=CLR_PROMISE)
+        self.btn_edit.configure(
+            text="修订选中条目" if shape == "qa" else "修订选中总结")
 
     # ================= 进度条 =================
     def _show_progress(self, text: str) -> None:
@@ -558,30 +692,43 @@ class App(tk.Tk):
                     wechat_state = "微信未运行"
                 if has_key:
                     key_state = "密钥已缓存 ✓"
-                    self.after(0, self.lbl_wx4_key_state.configure,
-                               text=key_state, foreground=CLR_OK)
+                    self._ui(self.lbl_wx4_key_state.configure,
+                             text=key_state, foreground=CLR_OK)
                 else:
                     key_state = "未抓取密钥"
-                    self.after(0, self.lbl_wx4_key_state.configure,
-                               text=key_state, foreground=CLR_ERR)
-                self.after(0, self.lbl_wx4_status.configure,
-                           text=f"账号: {acc.account} | {wechat_state}")
+                    self._ui(self.lbl_wx4_key_state.configure,
+                             text=key_state, foreground=CLR_ERR)
+                self._ui(self.lbl_wx4_status.configure,
+                         text=f"账号: {acc.account} | {wechat_state}")
             else:
-                self.after(0, self.lbl_wx4_status.configure,
-                           text="未检测到微信账号", foreground=CLR_ERR)
-                self.after(0, self.lbl_wx4_key_state.configure,
-                           text="", foreground=CLR_ERR)
+                self._ui(self.lbl_wx4_status.configure,
+                         text="未检测到微信账号", foreground=CLR_ERR)
+                self._ui(self.lbl_wx4_key_state.configure,
+                         text="", foreground=CLR_ERR)
         except Exception as e:
-            self.after(0, self.lbl_wx4_status.configure,
-                       text=f"检测失败: {e}", foreground=CLR_ERR)
-            self.after(0, self.lbl_wx4_key_state.configure,
-                       text="", foreground=CLR_ERR)
+            self._ui(self.lbl_wx4_status.configure,
+                     text=f"检测失败: {e}", foreground=CLR_ERR)
+            self._ui(self.lbl_wx4_key_state.configure,
+                     text="", foreground=CLR_ERR)
+
+    def _ui(self, fn, **kw) -> None:
+        """从后台线程安全地更新界面控件。
+
+        Tkinter 的 after 不是线程安全的：窗口已销毁、或主线程不在 mainloop 时，
+        它会抛 RuntimeError / TclError（实测打开界面后切换数据源就会刷出
+        「main thread is not in main loop」）。界面都没了就没有必要再更新它，
+        所以这里统一吞掉——顺带也避免退出时刷一屏无意义的报错。
+        """
+        try:
+            self.after(0, lambda: fn(**kw))
+        except (RuntimeError, tk.TclError):
+            pass
 
     def _wx4_capture_key(self) -> None:
         """抓取微信 4.x 数据库密钥（后台线程执行，不阻塞 GUI）。
 
-        优先走「不重启」的 V4 只读内存扫描(微信 4.x 活跃账号的密钥在内存中可取);
-        仅当 V4 扫描失败(如非活跃账号/微信未运行)才提示是否重启抓取。
+        走 V4 只读内存扫描。**本工具不会启动、也不会关闭微信** ——
+        密钥只存在于微信进程内存里，所以微信没运行时无法抓取，只能请用户自己打开。
         """
         try:
             env = locate.detect_wechat_env(force=True)
@@ -589,32 +736,36 @@ class App(tk.Tk):
                 messagebox.showerror("未找到账号", "未在本机找到已登录的微信 4.x 账号数据目录。")
                 return
 
-            # 微信运行中: 先试不重启的 V4 内存扫描(活跃账号密钥在内存, 秒级可取)。
+            # 微信运行中: V4 只读内存扫描（活跃账号密钥在内存, 秒级可取）。
             if env.running:
-                self._show_progress("正在扫描微信进程内存(只读, 不重启)…")
+                self._show_progress("正在扫描微信进程内存(只读)…")
                 threading.Thread(target=self._wx4_do_capture,
                                  args=(env, False),
                                  daemon=True).start()
                 return
 
-            # 微信未运行: 只能重启抓取。
-            ret = messagebox.askyesno(
-                "微信未运行",
-                "微信当前未运行。\n\n"
-                "是否自动启动微信并抓取密钥？\n"
-                "（启动后请在微信窗口扫码登录,等待约 1 分钟自动登录）")
-            if not ret:
-                return
-            self._show_progress("正在启动微信并抓取密钥（请扫码登录）…")
-            threading.Thread(target=self._wx4_do_capture,
-                             args=(env, True),
-                             daemon=True).start()
+            # 微信未运行: 密钥不在内存里, 抓不到 —— 只能请用户自己打开。
+            # 这里原先写的是「是否自动启动微信并抓取密钥？」，但本工具没有任何
+            # 启动微信的代码（全仓唯一的 os.startfile 是用来打开导出的 Excel 的），
+            # 点了「是」也不会有微信窗口弹出来，用户会一直等一个永远不出现的扫码界面。
+            self._hide_progress()
+            messagebox.showinfo(
+                "微信当前未运行",
+                "无法抓取密钥：密钥只存在于微信进程的内存里，微信没运行时取不到。\n\n"
+                "请先打开微信并登录，然后回到这里点「加载聊天对象」重新抓取。\n\n"
+                "（已经在别处抓过密钥的话不需要这一步 —— 缓存过密钥后即使微信"
+                "已退出，也能离线解密读记录。）")
+            return
         except Exception as e:
             self._hide_progress()
             messagebox.showerror("错误", f"抓取过程出错: {e}")
 
     def _wx4_do_capture(self, env, restart):
-        """后台线程：依次尝试所有已检测账号，找到密钥即停。"""
+        """后台线程：依次尝试所有已检测账号，找到密钥即停。
+
+        restart 只影响失败时的提示文案（它是 memkey.capture_key 的保留兼容参数，
+        不会真的重启微信），所以这里不去动它。
+        """
         from core.wx4.memkey import capture_key
         last_err = ""
         for acc in env.accounts:
@@ -635,9 +786,9 @@ class App(tk.Tk):
                 continue
         if restart:
             self.msg_q.put(("wx4_key_err",
-                f"尝试了 {len(env.accounts)} 个账号均未找到密钥(重启模式也失败)。\n{last_err}"))
+                f"又试了 {len(env.accounts)} 个账号仍未找到密钥。\n{last_err}"))
         else:
-            # V4 无重启扫描失败: 提示可再试重启模式(覆盖非活跃账号)。
+            # 首次扫描失败: 提示重启微信后重试（重启要用户自己做）。
             self.msg_q.put(("wx4_key_restart_hint", last_err))
 
     def _pick_path(self) -> None:
@@ -982,6 +1133,7 @@ class App(tk.Tk):
                         self.var_self_names.get().strip().replace("，", ",").split(",")
                         if x.strip()],
             engine=self.var_engine.get(),
+            output_format=self.var_format.get(),
             export_path=self.var_export.get().strip() or config.DEFAULTS["export_path"],
             export_mode=self.var_mode.get(),
         )
@@ -998,6 +1150,30 @@ class App(tk.Tk):
         stage = self.var_stage.get()
         self.cfg["customer_stage"] = "" if stage == "自动推断" else stage
         config.save(self.cfg)
+
+    def _update_engine_hint(self) -> None:
+        if hasattr(self, "lbl_eng_hint"):
+            self.lbl_eng_hint.configure(
+                text=self._ENG_HINT.get(self.var_engine.get(), ""))
+
+    def _update_format_ui(self) -> None:
+        """「仅问题答复清单」时，总结字数与客户阶段完全不影响结果，置灰并说明，
+        免得用户填了却奇怪为什么没生效。同时刷新两个说明行。"""
+        only_qa = self.var_format.get() == "qa"
+        st = "disabled" if only_qa else "normal"
+        self.ent_min.configure(state=st)
+        self.ent_max.configure(state=st)
+        self.cbo_stage.configure(state="disabled" if only_qa else "readonly")
+        self.lbl_chars_end.configure(text=" 字（仅沟通总结用）" if only_qa else " 字")
+        self.lbl_stage_hint.configure(
+            text="（仅沟通总结用，问答清单不受影响）" if only_qa
+            else "（续费期优先保留风险，稳定使用偏进展）")
+        if hasattr(self, "lbl_fmt_hint"):
+            self.lbl_fmt_hint.configure(
+                text=self._FMT_HINT.get(self.var_format.get(), ""))
+        self._update_engine_hint()
+        if hasattr(self, "tv_res"):
+            self._render_results()
 
     def _start(self) -> None:
         if self.busy:
@@ -1079,15 +1255,24 @@ class App(tk.Tk):
                     self._hide_progress()
                     messagebox.showerror("抓取失败", payload)
                 elif kind == "wx4_key_restart_hint":
-                    # V4 无重启扫描失败(非活跃账号/密钥不在内存): 询问是否重启重试。
+                    # V4 只读扫描失败(非活跃账号/密钥不在内存)。
+                    # 注意：本工具**不会**自己重启微信（memkey.capture_key 的 restart 参数
+                    # 是保留兼容用的空参数）。所以这里只能请用户手动重启，然后重试扫描。
+                    # 原先这里写的是「是否重启微信后重试？」，点了「是」其实只是再扫一次内存，
+                    # 而内存状态没变（微信没重启），必然同样失败——那个承诺是空的。
                     self._hide_progress()
                     ret = messagebox.askyesno(
                         "未取到密钥",
                         f"未能在运行中的微信内存里找到密钥。\n{payload}\n\n"
-                        "是否重启微信后重试？（重启后请扫码登录，覆盖非活跃账号）")
+                        "请手动重启微信后再试：\n"
+                        "  1. 右键任务栏托盘里的微信图标 → 退出（要完全退出，不是关窗口）\n"
+                        "  2. 重新打开微信并登录\n"
+                        "  3. 回到这里点「是」，重新扫描一次\n\n"
+                        "（本工具不会替你关闭微信。若刚登录的正是要提取的账号，"
+                        "关掉微信反而不利于取钥——先点「是」再扫一次也值得一试。）")
                     if ret:
                         env = locate.detect_wechat_env(force=True)
-                        self._show_progress("正在重启微信并抓取密钥（请扫码登录）…")
+                        self._show_progress("正在扫描微信进程内存(只读)…")
                         threading.Thread(target=self._wx4_do_capture,
                                          args=(env, True),
                                          daemon=True).start()
@@ -1099,15 +1284,30 @@ class App(tk.Tk):
                             text=self.lbl_src_state.cget("text").replace("正在加载…", "加载结束"))
         except queue.Empty:
             pass
-        self.after(120, self._drain_queue)
+        # 窗口已销毁时不要再排下一次：Tk 会报
+        # invalid command name "…_drain_queue"（关闭主窗口时能看到）。
+        try:
+            if self.winfo_exists():
+                self._drain_id = self.after(120, self._drain_queue)
+        except tk.TclError:
+            pass
 
     def _on_result(self, res: pipeline.RunResult) -> None:
         self.summaries.extend(res.summaries)
+        self.qa_items.extend(res.qa_items)
         self._render_results()
         self.pb.configure(value=self.pb.cget("maximum"))
-        parts = [f"完成：生成 {res.ok_count} 篇总结"]
+        parts = []
+        if res.summaries:
+            parts.append(f"生成 {res.ok_count} 篇总结")
+        if res.qa_items:
+            parts.append(f"生成 {res.qa_count} 条问题答复（{res.qa_kinds}）")
+        if not parts:
+            parts.append("没有生成内容")
         if res.export_path:
-            parts.append(f"已写入 {res.written} 行 → {res.export_path}")
+            parts.append(f"总结已写入 {res.written} 行 → {res.export_path}")
+        if res.qa_export_path:
+            parts.append(f"问答清单已写入 {res.qa_written} 条")
         if res.skipped:
             parts.append(f"{len(res.skipped)} 个对象被跳过")
         self.var_status.set("；".join(parts))
@@ -1119,20 +1319,49 @@ class App(tk.Tk):
         if degraded:
             detail += f"\n\n注意：{len(degraded)} 篇因 AI 不可用改用了本地总结。\n" \
                       f"原因示例：{degraded[0].error}"
-        if res.ok_count:
+        # 问答清单的降级也要说出来：用户选了 AI 却拿到离线结果，不说就是欺骗
+        if res.qa_notes:
+            detail += f"\n\n注意：{len(res.qa_notes)} 个对象的问答清单改用了本地引擎。\n" \
+                      f"原因示例：{res.qa_notes[0]}"
+        if res.summaries or res.qa_items:
             detail += "\n\n可在下方表格双击任意一行修订文字，改完点「导出到 Excel」再存一次。"
             messagebox.showinfo("处理完成", detail)
         else:
-            messagebox.showwarning("没有生成任何总结", detail or "所选时间范围内没有找到聊天记录。")
+            messagebox.showwarning("没有生成任何内容", detail or "所选时间范围内没有找到聊天记录。")
 
     def _render_results(self) -> None:
+        """按当前输出形式渲染结果表。两种形态的 iid 编号各自独立编号到对应列表。"""
+        shape = self._result_shape()
+        if shape != getattr(self, "_res_shape", None):
+            self._apply_result_columns(shape)
         self.tv_res.delete(*self.tv_res.get_children())
-        for i, s in enumerate(self.summaries):
-            tag = "ai" if s.engine == "ai" else "off"
-            self.tv_res.insert("", "end", iid=str(i),
-                               values=(s.customer_name, s.time_range, s.content,
-                                       f"{s.char_len} 字 / {'AI' if tag == 'ai' else '本地'}"))
-        self.lbl_res.configure(text=f"共 {len(self.summaries)} 篇总结")
+
+        if shape == "qa":
+            for i, it in enumerate(self.qa_items):
+                tag = ""
+                if it.status == QA_STATUS_PENDING:
+                    tag = "pend"
+                elif it.status == QA_STATUS_PROMISED:
+                    tag = "promise"
+                self.tv_res.insert(
+                    "", "end", iid=str(i),
+                    values=(it.customer_name, it.kind, it.ask_time, it.question_cell,
+                            it.answer or "", it.answer_time, it.status, it.raw),
+                    tags=(tag,) if tag else ())
+            pend = sum(1 for x in self.qa_items if x.status == QA_STATUS_PENDING)
+            promised = sum(1 for x in self.qa_items if x.status == QA_STATUS_PROMISED)
+            self.lbl_res.configure(
+                text=f"共 {len(self.qa_items)} 条问答"
+                     f"（未答复 {pend}、我方待办 {promised}）"
+                if self.qa_items else "暂无结果")
+        else:
+            for i, s in enumerate(self.summaries):
+                tag = "ai" if s.engine == "ai" else "off"
+                self.tv_res.insert("", "end", iid=str(i),
+                                   values=(s.customer_name, s.time_range, s.content,
+                                           f"{s.char_len} 字 / {'AI' if tag == 'ai' else '本地'}"))
+            self.lbl_res.configure(
+                text=f"共 {len(self.summaries)} 篇总结" if self.summaries else "暂无结果")
 
     # ================= 结果操作 =================
     def _current_index(self) -> Optional[int]:
@@ -1143,6 +1372,13 @@ class App(tk.Tk):
             return int(sel[0])
         except ValueError:
             return None
+
+    def _edit_row(self, _event=None) -> None:
+        """双击/按钮的统一入口：按当前结果形态分派到对应的编辑器。"""
+        if getattr(self, "_res_shape", "summary") == "qa":
+            self._edit_qa()
+        else:
+            self._edit_summary()
 
     def _edit_summary(self, _event=None) -> None:
         idx = self._current_index()
@@ -1185,24 +1421,138 @@ class App(tk.Tk):
         ttk.Button(row, text="保存修订", command=save).pack(side="right")
         ttk.Button(row, text="取消", command=win.destroy).pack(side="right", padx=6)
 
+    # ---------- 问答条目编辑器 ----------
+    @staticmethod
+    def _parse_hm(text: str, year: int) -> Optional[datetime]:
+        """解析「MM-DD HH:MM」并补上年份。无效返回 None（不抛异常，由调用方提示）。"""
+        t = (text or "").strip().replace("/", "-")
+        if not t:
+            return None
+        for fmt in ("%m-%d %H:%M", "%m-%d %H:%M:%S"):
+            try:
+                d = datetime.strptime(t, fmt)
+            except ValueError:
+                continue
+            return d.replace(year=year)
+        return None
+
+    def _edit_qa(self, _event=None) -> None:
+        idx = self._current_index()
+        if idx is None or idx >= len(self.qa_items):
+            messagebox.showinfo("请先选一行", "请先在结果表格里点选一行，再点「修订选中条目」。")
+            return
+        it = self.qa_items[idx]
+        win = tk.Toplevel(self)
+        win.title(f"修订问答条目 —— {it.customer_name}")
+        win.geometry("720x620")
+        win.transient(self)
+        win.grab_set()
+        ttk.Label(win, text=f"{it.customer_name}    {it.kind}    {it.status}",
+                  style="Head.TLabel").pack(anchor="w", padx=12, pady=(12, 6))
+
+        # 类型 / 状态 / 提问时间
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=12)
+        ttk.Label(top, text="类型：").pack(side="left")
+        var_kind = tk.StringVar(value=it.kind)
+        ttk.Combobox(top, textvariable=var_kind, state="readonly", width=10,
+                     values=list(QA_KINDS)).pack(side="left")
+        ttk.Label(top, text="　提问时间：").pack(side="left")
+        var_atime = tk.StringVar(value=it.ask_time)
+        ttk.Entry(top, textvariable=var_atime, width=13).pack(side="left")
+        ttk.Label(top, text="　状态：").pack(side="left")
+        var_status = tk.StringVar(value=it.status)
+        ttk.Combobox(top, textvariable=var_status, state="readonly", width=16,
+                     values=[QA_STATUS_DONE, QA_STATUS_PENDING,
+                             QA_STATUS_PROMISED]).pack(side="left")
+        ttk.Label(win, text="时间格式 MM-DD HH:MM；「我方待办」行的提问时间可留空。",
+                  style="Hint.TLabel").pack(anchor="w", padx=12, pady=(4, 0))
+
+        ttk.Label(win, text="客户问题（「我方待办」行留空即可）：").pack(
+            anchor="w", padx=12, pady=(10, 2))
+        q_txt = tk.Text(win, wrap="word", font=("微软雅黑", 10), height=4)
+        q_txt.pack(fill="x", padx=12)
+        q_txt.insert("1.0", "" if it.question == "—" else it.question)
+
+        ttk.Label(win, text="我方答复/处理：").pack(anchor="w", padx=12, pady=(10, 2))
+        a_txt = tk.Text(win, wrap="word", font=("微软雅黑", 10), height=5)
+        a_txt.pack(fill="x", padx=12)
+        a_txt.insert("1.0", it.answer or "")
+
+        ttk.Label(win, text="原始记录（只读，供核对原话）：").pack(
+            anchor="w", padx=12, pady=(10, 2))
+        raw = tk.Text(win, wrap="word", font=("微软雅黑", 9), height=4,
+                      background="#F5F6F8")
+        raw.pack(fill="both", expand=True, padx=12)
+        raw.insert("1.0", it.raw)
+        raw.configure(state="disabled")
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=12, pady=10)
+
+        def save():
+            at = self._parse_hm(var_atime.get(), (it.ask_ts or datetime.now()).year)
+            if var_atime.get().strip() and at is None:
+                messagebox.showerror("提问时间格式不对",
+                                     "请按 MM-DD HH:MM 填写，例如 08-13 09:19。")
+                return
+            it.kind = var_kind.get()
+            it.status = var_status.get()
+            it.question = q_txt.get("1.0", "end-1c").strip()
+            it.answer = a_txt.get("1.0", "end-1c").strip()
+            if at is not None:
+                it.ask_ts = at
+            # 状态与时间必须自洽：说"已答复"就必须有答复正文，
+            # 标成"未答复/待跟进"就不能留着会让人以为已闭环的答复时间。
+            if it.kind == "我方待办":
+                it.question = ""
+                it.answer_ts = None
+            elif it.status == QA_STATUS_DONE:
+                if not it.answer:
+                    messagebox.showerror(
+                        "缺答复内容", "状态是「已答复」时必须填写我方答复/处理。\n"
+                                     "如果其实没回，请把状态改成「未答复（待跟进）」。")
+                    return
+                if it.answer_ts is None:
+                    it.answer_ts = it.ask_ts
+            else:
+                it.answer_ts = None
+            self._render_results()
+            win.destroy()
+
+        ttk.Button(row, text="保存修订", command=save).pack(side="right")
+        ttk.Button(row, text="取消", command=win.destroy).pack(side="right", padx=6)
+
     def _export(self) -> None:
-        if not self.summaries:
-            messagebox.showinfo("没有可导出的内容", "请先生成总结，再执行导出。")
+        fmt = self.var_format.get()
+        want_s = fmt in ("both", "summary")
+        want_q = fmt in ("both", "qa")
+        if (want_s and not self.summaries) and (want_q and not self.qa_items):
+            messagebox.showinfo("没有可导出的内容", "请先生成内容，再执行导出。")
             return
         self._sync_cfg()
         try:
-            res = pipeline.export_only(self.cfg, self.summaries)
+            res = pipeline.export_results(self.cfg, self.summaries, self.qa_items)
         except PermissionError as e:
             messagebox.showerror("文件被占用", str(e))
             return
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
             return
-        self.var_status.set(f"已导出 {res.written} 行 → {res.export_path}")
-        if messagebox.askyesno("导出完成",
-                               f"已写入 {res.written} 行，文件共 {res.total_rows} 行数据。\n\n"
-                               f"{res.export_path}\n\n现在打开这个文件吗？"):
-            self._open_file(res.export_path)
+        parts, lines = [], []
+        if res.export_path:
+            parts.append(f"总结 {res.written} 行")
+            lines.append(f"「客户沟通总结」写入 {res.written} 行，表内共 {res.total_rows} 行")
+        if res.qa_export_path:
+            parts.append(f"问答清单 {res.qa_written} 条")
+            lines.append(f"「客户问题答复清单」写入 {res.qa_written} 条，"
+                         f"表内共 {res.qa_total_rows} 条")
+        path = res.qa_export_path or res.export_path
+        self.var_status.set("已导出：" + "、".join(parts) + f" → {path}")
+        if messagebox.askyesno(
+                "导出完成",
+                "、".join(parts) + "。\n\n" + "\n".join(lines) + f"\n\n{path}\n\n现在打开这个文件吗？"):
+            self._open_file(path)
 
     def _open_export(self) -> None:
         p = self.var_export.get().strip()
@@ -1224,10 +1574,11 @@ class App(tk.Tk):
             messagebox.showerror("打不开文件", f"请手动打开：\n{path}\n\n({e})")
 
     def _clear_res(self) -> None:
-        if self.summaries and not messagebox.askyesno(
+        if (self.summaries or self.qa_items) and not messagebox.askyesno(
                 "确认清空", "只清空界面上的结果列表，已导出的 Excel 文件不受影响。继续吗？"):
             return
         self.summaries.clear()
+        self.qa_items.clear()
         self._render_results()
 
     def _pick_export(self) -> None:
@@ -1237,6 +1588,514 @@ class App(tk.Tk):
             initialfile=Path(self.var_export.get() or "微信客户沟通总结.xlsx").name)
         if p:
             self.var_export.set(p)
+
+    # ================= 我方成员 / 名称库 =================
+    def _self_library(self) -> List[str]:
+        """取名称库。已配置的 self_names 自动并进来——
+        这样老配置（只有 self_names、还没有库）第一次打开窗口时，
+        现有名字就自动入了库，不需要额外的迁移步骤。"""
+        return merge_names(self.cfg.get("self_name_library") or [],
+                           split_names(self.var_self_names.get()))
+
+    def _open_self_picker(self) -> None:
+        """列出「可能是我方同事」的人，供勾选，并把认过的人存进名称库。
+
+        名单有三条来源，合并进同一张表：
+          1) 名称库：以前存下来的同事，本次是否使用由勾选决定；
+          2) 已配置的 self_names：默认勾上——这样配错了也能取消勾选；
+          3) 扫描：从已勾选的聊天对象里按行为证据找出新候选，默认不勾。
+        只给候选、不替用户决定：判定"谁是同事"是业务问题，猜错会把客户的话
+        当成我方答复，比漏掉更难发现。
+
+        库与选用是两件事：取消勾选只是"这次不用"，不会把人从库里删掉；
+        要真删得点「从名称库删除」。
+        """
+        win = tk.Toplevel(self)
+        win.title("选择我方成员")
+        win.geometry("900x640")
+        win.minsize(780, 520)
+        win.transient(self)
+        win.grab_set()
+
+        ttk.Label(win, text="我方成员（同事也算）", style="Head.TLabel").pack(
+            anchor="w", padx=12, pady=(12, 4))
+        ttk.Label(
+            win,
+            text="群聊里同事的发言也要算作「我方」，否则他们的答复会被当成客户发言，"
+                 "问答清单会大面积显示「未答复」。\n"
+                 "带 ☑ 的是本次要用的成员。名称库里的同事长期存着，不勾就只是这次不用，"
+                 "不会被删掉；点「确定」时会把本次勾选的人都存进库。",
+            style="Hint.TLabel", justify="left", wraplength=850).pack(anchor="w", padx=12)
+
+        picked = [c for c in self.contacts if c.cid in self.picked]
+        try:
+            start = pipeline.parse_day(self.var_start.get(), "开始日期")
+            end = pipeline.parse_day(self.var_end.get(), "结束日期")
+        except ValueError:
+            start = end = None
+
+        # 名称库（长期存）
+        library: List[str] = self._self_library()
+        # 勾选状态：名字 -> 是否勾选。预填写 = 已配置的一律先勾上。
+        state: Dict[str, bool] = {}
+        for n in split_names(self.var_self_names.get()):
+            state[n] = True
+        # 候选项：名字 -> Candidate（同一名字保留评分更高的那条）
+        rows: Dict[str, Candidate] = {}
+        for n in library:
+            rows[n] = Candidate(name=n, cid="（名称库）", reasons=["名称库"])
+        for n in state:
+            rows.setdefault(n, Candidate(name=n, cid="（已配置）", reasons=["已配置"]))
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(
+            bar,
+            text=(f"将扫描已勾选的 {len(picked)} 个聊天对象" if picked
+                  else "尚未勾选聊天对象（请先在第 ① ② 步加载并勾选）"),
+            style="Hint.TLabel").pack(side="left")
+        var_state = tk.StringVar(value="")
+        btn_scan = ttk.Button(bar, text="开始扫描", width=10)
+        btn_scan.pack(side="left", padx=8)
+        ttk.Label(bar, textvariable=var_state, style="Hint.TLabel").pack(side="left")
+
+        addrow = ttk.Frame(win)
+        addrow.pack(fill="x", padx=12, pady=(2, 4))
+        ttk.Label(addrow, text="手动添加：").pack(side="left")
+        var_new = tk.StringVar()
+        ent_new = ttk.Entry(addrow, textvariable=var_new, width=20)
+        ent_new.pack(side="left", padx=(4, 0))
+        # command 稍后再接：add_manual 定义在后面（和 btn_scan 同样的写法）
+        btn_add = ttk.Button(addrow, text="添加", width=6)
+        btn_add.pack(side="left", padx=(6, 0))
+        ttk.Label(addrow, text="（输名字后回车或点「添加」，会存进名称库）",
+                  style="Hint.TLabel").pack(side="left", padx=6)
+
+        librow = ttk.Frame(win)
+        librow.pack(fill="x", padx=12, pady=(0, 6))
+        var_lib = tk.StringVar(value=f"名称库：{len(library)} 人")
+        ttk.Label(librow, textvariable=var_lib, style="Hint.TLabel").pack(side="left")
+
+        def call_import() -> None:
+            """从 Excel 导入姓名：先让用户确认是哪一列，再入库。"""
+            p = filedialog.askopenfilename(
+                title="选择含我方成员姓名的 Excel", parent=win,
+                filetypes=[("Excel 工作簿", "*.xlsx *.xlsm"), ("所有文件", "*.*")])
+            if not p:
+                return
+            try:
+                cols = read_columns(p)
+            except Exception as e:                                   # noqa: BLE001
+                messagebox.showerror("读取失败",
+                                     f"打不开这个文件：{e}\n\n"
+                                     "请确认它是 .xlsx 工作簿，且没有被其他程序占用。",
+                                     parent=win)
+                return
+            # 只保留清洗后真有名字的列
+            usable = [c for c in cols if c.names]
+            if not usable:
+                messagebox.showwarning(
+                    "没找到姓名",
+                    "这个文件里没有读得出姓名的列。\n\n"
+                    "可能是：内容在另一个 sheet、姓名被合并单元格包着，"
+                    "或者表里只有数字。\n可以先用「手动添加」。", parent=win)
+                return
+            ask_import_column(win, p, usable)
+
+        def ask_import_column(parent, path: str, usable: list) -> None:
+            """让用户挑列并预览——员工表里序号/部门/手机号列都很像，不能猜。"""
+            dlg = tk.Toplevel(parent)
+            dlg.title("选择姓名列")
+            dlg.geometry("560x580")
+            dlg.transient(parent)
+            dlg.grab_set()
+
+            ttk.Label(dlg, text=f"从「{Path(path).name}」导入姓名",
+                      style="Head.TLabel").pack(anchor="w", padx=12, pady=(12, 2))
+            guess = name_library.guess_column(usable)
+            var_col = tk.StringVar(
+                value=(guess.label if guess else usable[0].label))
+            ttk.Label(dlg, text="请选择姓名所在的列：", style="Hint.TLabel").pack(
+                anchor="w", padx=12)
+            cbo = ttk.Combobox(dlg, textvariable=var_col, state="readonly",
+                               values=[c.label for c in usable], width=48)
+            cbo.pack(anchor="w", padx=12, pady=(2, 8))
+
+            ttk.Label(dlg, text="将要导入的名字（可上下滚动核对）：",
+                      style="Hint.TLabel").pack(anchor="w", padx=12)
+            wrap = ttk.Frame(dlg)
+            wrap.pack(fill="both", expand=True, padx=12, pady=(2, 6))
+            wrap.columnconfigure(0, weight=1)
+            wrap.rowconfigure(0, weight=1)
+            tv2 = ttk.Treeview(wrap, show="headings", columns=("n",), height=10)
+            tv2.heading("n", text="名字")
+            tv2.column("n", width=200, anchor="w")
+            tv2.grid(row=0, column=0, sticky="nsew")
+            sb2 = ttk.Scrollbar(wrap, orient="vertical", command=tv2.yview)
+            sb2.grid(row=0, column=1, sticky="ns")
+            tv2.configure(yscrollcommand=sb2.set)
+
+            var_cnt = tk.StringVar()
+
+            def by_label(label: str):
+                return next(c for c in usable if c.label == label)
+
+            def redraw(*_a) -> None:
+                col = by_label(var_col.get())
+                tv2.delete(*tv2.get_children())
+                for i, n in enumerate(col.names):
+                    tv2.insert("", "end", iid=str(i), values=(n,))
+                var_cnt.set(f"共 {len(col.names)} 个名字")
+
+            cbo.bind("<<ComboboxSelected>>", redraw)
+            redraw()
+            ttk.Label(dlg, textvariable=var_cnt, style="Hint.TLabel").pack(
+                anchor="w", padx=12)
+            ttk.Label(dlg, style="Hint.TLabel", justify="left", wraplength=520,
+                      text="导入会按这个文件更新名称库：文件里的名字进库，"
+                           "库里不在文件里的人会被移除——点「导入这些名字」后"
+                           "会先列出将要新增和移除的名单，你确认了才生效。\n"
+                           "若导入的是整个部门/公司的大名单，请取消下面的勾选——"
+                           "勾上会让这些人全部成为「我方成员」，「我方」认错了会把"
+                           "客户的发言当成我们的答复。"
+                      ).pack(anchor="w", padx=12)
+
+            foot2 = ttk.Frame(dlg)
+            foot2.pack(fill="x", padx=12, pady=(4, 10))
+
+            var_use = tk.BooleanVar(value=True)
+            ttk.Checkbutton(
+                foot2, text="导入后同时勾选为本次使用",
+                variable=var_use).pack(side="left")
+
+            def brief(names: list) -> str:
+                """名单太长就截断——弹窗要放得下，也不能一屏名字吓到人。"""
+                head = "、".join(names[:12])
+                return head if len(names) <= 12 else f"{head} 等共 {len(names)} 人"
+
+            def replace_summary(filename: str, added: list, removed: list,
+                                total: int) -> str:
+                lines = [f"将按「{filename}」更新名称库：", ""]
+                lines.append(f"· 新增 {len(added)} 人：{brief(added)}" if added
+                             else "· 没有新增")
+                lines.append(f"· 移除 {len(removed)} 人：{brief(removed)}")
+                lines += ["",
+                          "被移除的人如果现在勾着，会一并取消勾选——勾选的人在点"
+                          "「确定」时会顺手入库，不取消就等于删不掉。",
+                          "",
+                          f"更新后名称库共 {total} 人。"]
+                return "\n".join(lines)
+
+            def do_add() -> None:
+                """按导入的文件更新名称库：以文件为准，库里多出来的人会被移除。"""
+                col = by_label(var_col.get())
+                use = bool(var_use.get())
+                incoming = list(col.names)                 # 以这个文件为准
+                keep = set(incoming)
+                removed = [n for n in library if n not in keep]
+                added = [n for n in incoming if n not in library]
+                total = len(library) - len(removed) + len(added)
+                if not removed and not added:
+                    dlg.destroy()
+                    var_state.set(f"名称库与「{Path(path).name}」一致，没有变化")
+                    return
+                # 只有**会删人**时才拦一道：纯新增没有数据损失，不必多按一次。
+                # 拦的理由——导错文件（比如翻出一份旧模版）会把库里的人清掉，
+                # 而名称库是长期资产，误清一次就得重新导一遍。
+                if removed and not messagebox.askokcancel(
+                        "确认更新名称库",
+                        replace_summary(Path(path).name, added, removed, total),
+                        parent=dlg):
+                    return
+                # 移除必须**同时取消勾选**：点「确定」时"勾选的人顺手入库"
+                # （见 ok() 里的 merge_names(library, names)），
+                # 只从 library 删、state 里还勾着，那人会被原样加回库里。
+                for n in removed:
+                    state.pop(n, None)
+                    rows.pop(n, None)
+                library[:] = incoming        # 就地替换：外面几个闭包共用这个 list
+                # 勾了才设为本次使用。导一份大花名册（整个部门/公司）时应当取消勾选：
+                # 那批人会全部变成「我方成员」，而「我方」认错了会让**客户的发言
+                # 被当成我们的答复**，问答清单内容错配，比漏掉更难发现。
+                for n in incoming:
+                    state[n] = use
+                    rows.setdefault(n, Candidate(name=n, cid="（导入）",
+                                                 reasons=[f"导入自 {Path(path).name}"]))
+                var_lib.set(f"名称库：{len(library)} 人")
+                dlg.destroy()
+                draw()
+                parts = []
+                if added:
+                    parts.append(f"新增 {len(added)} 人")
+                if removed:
+                    parts.append(f"移除 {len(removed)} 人")
+                what = f"已按「{Path(path).name}」更新名称库（{'、'.join(parts)}）"
+                var_state.set(
+                    f"{what}，并勾选为本次使用" if use
+                    else f"{what}（只入库，未勾选；要用请在上表勾上）")
+
+            ttk.Button(foot2, text="取消", command=dlg.destroy).pack(side="right")
+            ttk.Button(foot2, text="导入这些名字", command=do_add).pack(
+                side="right", padx=6)
+
+        def call_export_template() -> None:
+            """导出模版：表头（必填标红）+ 把当前名称库的人带出去，改完再导入。"""
+            p = filedialog.asksaveasfilename(
+                title="保存 Excel 模版", parent=win,
+                defaultextension=".xlsx",
+                initialfile=name_library.TEMPLATE_FILENAME,
+                filetypes=[("Excel 工作簿", "*.xlsx")])
+            if not p:
+                return
+            try:
+                out = name_library.write_template(p, library)
+            except Exception as e:                                   # noqa: BLE001
+                messagebox.showerror(
+                    "导出失败",
+                    f"写不了这个文件：{e}\n\n"
+                    "常见原因：同名文件正被 Excel 打开着。关掉后重试即可。",
+                    parent=win)
+                return
+            messagebox.showinfo(
+                "模版已导出",
+                f"已保存到：\n{out}\n\n"
+                f"模版里已经带出当前名称库的 {len(library)} 个人"
+                "（填在「姓名」列，红色表头那一列）。\n\n"
+                "你可以直接在上面改：\n"
+                "· 要加人：在最后一行下面接着写名字；\n"
+                "· 要删人：把那一行整行删掉；\n"
+                "· 部门 / 手机号 / 备注随便填，导入时会被忽略"
+                "（名称库只存姓名）。\n\n"
+                "改完回到这里，点「导入 Excel…」选这个文件——"
+                "导入会按这个文件更新名称库，文件里没有的人会从库里移除，"
+                "所以导入前会先列出将要新增和移除的名单，你确认了才生效。",
+                parent=win)
+
+        btn_import = ttk.Button(librow, text="导入 Excel…", width=12,
+                                command=call_import)
+        btn_import.pack(side="left", padx=(10, 0))
+        ttk.Button(librow, text="导出 Excel 模版", width=15,
+                   command=call_export_template).pack(side="left", padx=(6, 0))
+
+        wrap = ttk.Frame(win)
+        wrap.pack(fill="both", expand=True, padx=12)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        tv = ttk.Treeview(wrap, show="headings", selectmode="browse",
+                          columns=("chk", "name", "cid", "cnt", "why"))
+        for cid, text, w, stretch in (
+                ("chk", "选", 36, False), ("name", "名字", 150, False),
+                ("cid", "账号", 190, False), ("cnt", "发言", 56, False),
+                ("why", "来源 / 判断依据", 390, True)):
+            tv.heading(cid, text=text)
+            tv.column(cid, width=w, stretch=stretch, minwidth=36,
+                      anchor="w" if cid in ("name", "cid", "why") else "center")
+        tv.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        # 横向滚动条：五列加起来比窗口最窄时宽（来源/判断依据那列尤其长），
+        # 没有它的话窗口一小，最右边那列就看不全、也滚不过去。
+        sb_x = ttk.Scrollbar(wrap, orient="horizontal", command=tv.xview)
+        sb_x.grid(row=1, column=0, sticky="ew")
+        tv.configure(yscrollcommand=sb.set, xscrollcommand=sb_x.set)
+
+        var_sum = tk.StringVar(value="")
+        lbl_sum = ttk.Label(win, textvariable=var_sum, style="Hint.TLabel",
+                            wraplength=850, justify="left")
+
+        def refresh_sum() -> None:
+            names = [n for n, on in state.items() if on]
+            lbl_sum.configure(
+                text=(f"已选 {len(names)} 人：" + "、".join(names)) if names
+                else "已选 0 人：不填的话，群聊里同事的答复会被当成客户发言。")
+
+        def draw() -> None:
+            keep = tv.selection()
+            tv.delete(*tv.get_children())
+            for i, name in enumerate(rows):
+                c = rows[name]
+                tv.insert("", "end", iid=str(i),
+                          values=("☑" if state.get(name) else "☐", c.name, c.cid,
+                                  c.msg_count or "", "；".join(c.reasons)))
+            if keep and tv.exists(keep[0]):
+                tv.selection_set(keep[0])
+            refresh_sum()
+
+        def toggle(_event=None):
+            sel = tv.selection()
+            if not sel:
+                return
+            name = list(rows)[int(sel[0])]
+            state[name] = not state.get(name, False)
+            tv.set(sel[0], "chk", "☑" if state[name] else "☐")
+            refresh_sum()
+
+        def add_manual(_event=None):
+            """手动输入：同时勾上并存进名称库（用户主动输的，意图明确）。
+
+            刻意**不过滤**用户敲进来的名字——静默丢掉会让人以为"加了没生效"。
+            但会提示不像人名的输入：名称库是用部分匹配判我方身份的，
+            一个泛词（部门名、手机号）留在库里可能误伤真实客户发言。
+            """
+            added = split_names(var_new.get())
+            if not added:
+                return
+            for n in added:
+                state[n] = True
+                rows.setdefault(n, Candidate(name=n, cid="（手动添加）",
+                                             reasons=["手动添加"]))
+                if n not in library:
+                    library.append(n)
+            var_new.set("")
+            var_lib.set(f"名称库：{len(library)} 人")
+            odd = name_library.suspect_names(added)
+            if odd:
+                var_state.set(f"已添加，但「{'、'.join(odd)}」看起来不像人名，建议核对")
+            draw()
+
+        def remove_from_library(_event=None):
+            """从名称库删除选中的人（取消勾选做不到这件事，必须显式删）。"""
+            sel = tv.selection()
+            if not sel:
+                messagebox.showinfo("先选一行", "请先在表里点一下要删除的人。",
+                                    parent=win)
+                return
+            name = list(rows)[int(sel[0])]
+            if name not in library:
+                messagebox.showinfo(
+                    "不在名称库里",
+                    f"「{name}」还不在名称库里（可能是扫描出来的候选），"
+                    "不用删；不勾选它就不会被使用。", parent=win)
+                return
+            if not messagebox.askyesno(
+                    "从名称库删除",
+                    f"确定把「{name}」从名称库里删掉吗？\n\n"
+                    "删掉后本次也不再使用它；以后需要可以重新添加或导入。",
+                    parent=win):
+                return
+            library.remove(name)
+            state.pop(name, None)
+            rows.pop(name, None)
+            var_lib.set(f"名称库：{len(library)} 人")
+            draw()
+
+        # 后台扫描：抓取聊天记录是重 IO，绝不能卡住界面
+        scan_q: "queue.Queue[tuple]" = queue.Queue()
+        # 轮询开关。poll 只是个"读队列→刷新界面"的循环，必须有人**启动**它；
+        # 之前漏了启动，结果后台线程把结果塞进 scan_q 却没人读，
+        # 界面永远停在"正在准备…"——所以这里用显式开关，扫完就停。
+        polling = {"on": False}
+
+        def scan_work():
+            try:
+                src = pipeline.build_source(self.cfg)
+            except Exception as e:                                   # noqa: BLE001
+                scan_q.put(("err", f"打开数据源失败：{e}"))
+                return
+            # 已在表里的人不再作为候选（它们已经在表里了），只找新的人
+            known = list(state) + [n for n in library if n not in state]
+            found: Dict[str, Candidate] = {}
+            for i, c in enumerate(picked, start=1):
+                scan_q.put(("prog", f"[{i}/{len(picked)}] 正在看「{c.name}」…"))
+                try:
+                    msgs = src.fetch(c, start, end)
+                except Exception:                                    # noqa: BLE001
+                    continue
+                for cand in suggest_self_members(
+                        msgs, known_self=known, owner_names=known + [c.name],
+                        min_msgs=2, top=40):
+                    prev = found.get(cand.name)
+                    if prev is None or cand.score > prev.score:
+                        found[cand.name] = cand
+            scan_q.put(("done", sorted(found.values(),
+                                       key=lambda x: (-x.score, -x.msg_count))))
+
+        def do_scan():
+            if not picked:
+                messagebox.showinfo(
+                    "先选聊天对象",
+                    "请先在第 ① 步「加载聊天对象」，并在第 ② 步勾选至少一个群聊，"
+                    "再来扫描。\n\n如果你已经知道同事的名字，也可以用「手动添加」"
+                    "或「导入 Excel…」。", parent=win)
+                return
+            if start is None or end is None:
+                messagebox.showerror("日期填写有误",
+                                     "请先在第 ③ 步把开始日期和结束日期填好，再扫描。",
+                                     parent=win)
+                return
+            btn_scan.configure(state="disabled")
+            var_state.set("正在准备…")
+            start_polling()                       # 不启动就没人读 scan_q，界面会一直卡住
+            threading.Thread(target=scan_work, daemon=True).start()
+
+        btn_scan.configure(command=do_scan)
+        btn_add.configure(command=add_manual)
+        ent_new.bind("<Return>", add_manual)
+
+        def start_polling():
+            """启动轮询循环（重复点扫描不会起两个循环）。"""
+            if polling["on"]:
+                return
+            polling["on"] = True
+            win.after(150, poll)
+
+        def poll():
+            try:
+                while True:
+                    kind, payload = scan_q.get_nowait()
+                    if kind == "prog":
+                        var_state.set(payload)
+                    elif kind == "err":
+                        var_state.set("扫描失败")
+                        btn_scan.configure(state="normal")
+                        polling["on"] = False          # 出错了，停掉循环
+                        messagebox.showerror("扫描失败", payload, parent=win)
+                    elif kind == "done":
+                        found = list(payload)
+                        self.self_candidates = found      # 记住，重开窗口不用再扫
+                        for c in found:
+                            rows[c.name] = c
+                        var_state.set(f"找到 {len(found)} 个新候选" if found
+                                      else "没有找到新的候选，可手动添加或导入 Excel")
+                        btn_scan.configure(state="normal")
+                        polling["on"] = False          # 扫完了，停掉循环
+                        draw()
+            except queue.Empty:
+                pass
+            try:
+                if polling["on"] and win.winfo_exists():
+                    win.after(150, poll)
+            except tk.TclError:
+                pass
+
+        foot = ttk.Frame(win)
+        foot.pack(fill="x", padx=12, pady=(6, 10))
+        lbl_sum.pack(in_=foot, side="left")
+
+        def ok():
+            names = [n for n, on in state.items() if on]
+            self.var_self_names.set(", ".join(names))
+            # 入库口径是「本地库 + 本次勾选」：
+            #   用本地库而不是 cfg 里的旧库，才不会把"导入了但这次没勾"的人丢掉；
+            #   加上勾选的人，是因为勾选等于你认过他是同事，顺手存下来下次不用重输。
+            #   取消勾选不入库删除——那只是"这次不用"。
+            self.cfg["self_name_library"] = merge_names(library, names)
+            self._sync_cfg()
+            win.destroy()
+
+        ttk.Button(foot, text="确定", command=ok).pack(side="right")
+        ttk.Button(foot, text="取消", command=win.destroy).pack(side="right", padx=6)
+        ttk.Button(foot, text="从名称库删除", command=remove_from_library).pack(
+            side="right", padx=6)
+        tv.bind("<Button-1>", toggle)
+        tv.bind("<space>", toggle)
+
+        # 复用上次扫到的候选，避免每次开窗都重扫一遍
+        for c in getattr(self, "self_candidates", []) or []:
+            rows.setdefault(c.name, c)
+        draw()
+        if not picked:
+            var_state.set("请先勾选聊天对象；也可手动添加或导入 Excel")
 
     # ================= 设置与帮助 =================
     def _open_ai_settings(self) -> None:
@@ -1496,7 +2355,8 @@ class App(tk.Tk):
             "只读扫描微信进程内存来抓取数据库密钥（无注入、无重启、无网络）。\n"
             "   · 首次使用请在微信保持登录状态，点「加载聊天对象」自动抓取密钥并缓存；\n"
             "   · 若密钥未缓存，可点「加载聊天对象」→ 自动触发抓取（需微信运行中）；\n"
-            "   · 也可通过命令行 python cli.py wx4-capture --restart 重启微信后抓取。\n\n"
+            "   · 抓取失败时请**手动**退出微信（托盘图标右键 → 退出）再重新打开登录，然后重试；\n"
+            "     本工具不会替你关闭微信。\n\n"
             "2) 内置样例数据 —— 免配置。用于试用、培训、验收产出格式。\n\n"
             "3) 导入聊天记录文件（推荐 · 跨平台）—— 把聊天记录导出成 csv / txt / json 或整包 .zip，"
             "本工具直接读（.zip 自动解压）。一个会话对应一个聊天对象，会话名取自导出里的真实名称。"
@@ -1512,13 +2372,15 @@ class App(tk.Tk):
         ))
 
     def _show_about(self) -> None:
-        from core import __version__
         messagebox.showinfo("关于", (
-            f"{APP_TITLE}  v{__version__}\n\n"
+            f"{APP_TITLE}  v{__version__}（{_build_tag()}）\n\n"
             "面向客户成功团队的沟通记录归档工具。\n"
             "支持可视化操作、批量多选、AI（WorkBuddy / 任意 OpenAI 兼容）/ 本地双引擎总结、"
             "Excel 三列标准输出。\n"
-            "同时提供命令行入口 cli.py，可接入 WorkBuddy 自动化工作流。"
+            "同时提供命令行入口 cli.py，可接入 WorkBuddy 自动化工作流。\n\n"
+            "改动源码后如需在打包版里生效，必须重新打包：\n"
+            "1) pyinstaller wxcsm_app.spec --noconfirm --distpath dist\n"
+            "2) python make_installer.py"
         ))
 
     def _on_close(self) -> None:
@@ -1528,16 +2390,42 @@ class App(tk.Tk):
             self._sync_cfg()
         except Exception:
             pass
+        self._stop_queue_poll()
         self.destroy()
+
+    def _on_destroy(self, event=None) -> None:
+        """<Destroy> 会为每个子控件冒泡触发，只认主窗口自己那一次。"""
+        if event is not None and event.widget is not self:
+            return
+        self._stop_queue_poll()
+
+    def _stop_queue_poll(self) -> None:
+        """取消待触发的 _drain_queue 定时器。
+
+        不取消的话，销毁窗口时那个已排队的 after 仍会触发，Tk 找不到已删除的
+        命令就抛 `invalid command name "…_drain_queue"`——关闭程序时能在控制台
+        看到。窗口都关了，这次轮询本来也没有意义。
+        """
+        aid = getattr(self, "_drain_id", None)
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except (tk.TclError, ValueError):
+                pass
+            self._drain_id = None
 
 
 def _try_restore_existing() -> bool:
-    """若已有实例的主窗口在运行(可能被最小化), 还原并置前, 返回 True。"""
+    """若已有实例的主窗口在运行(可能被最小化), 还原并置前, 返回 True。
+
+    标题必须用 APP_TITLE_FULL（窗口标题带版本号）：和 self.title() 写进去的
+    字符串不一致的话这里永远找不到窗口，单实例保护就形同虚设。
+    """
     try:
         import ctypes
         from ctypes import wintypes
         u = ctypes.windll.user32
-        hwnd = u.FindWindowW(None, APP_TITLE)
+        hwnd = u.FindWindowW(None, APP_TITLE_FULL)
         if not hwnd:
             return False
         # SW_RESTORE=9; 最小化时还原到原位置并置前
@@ -1550,13 +2438,13 @@ def _try_restore_existing() -> bool:
 
 def main() -> None:
     # 单实例: 用一个命名互斥体判断是否已有实例在运行。
-    # 场景: 用户把窗口最小化到任务栏后, 再次双击启动工具.exe, 若已有实例,
+    # 场景: 用户把窗口最小化到任务栏后, 再次双击绿泡泡聊天记录总结.exe, 若已有实例,
     # 就直接把已有窗口还原置前并退出本次启动, 避免"打不开/多开多个"。
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
         kernel32.CreateMutexW.restype = ctypes.c_void_p
-        _mutex = kernel32.CreateMutexW(None, False, "Global\\wxcsm_启动工具_single")
+        _mutex = kernel32.CreateMutexW(None, False, "Global\\wxcsm_绿泡泡聊天记录总结_single")
         already = kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
     except Exception:
         _mutex, already = None, False
@@ -1574,7 +2462,7 @@ if __name__ == "__main__":
     except Exception as e:  # 窗口化启动时异常不会显示在控制台，必须自行记录日志
         import traceback as _tb
         from pathlib import Path as _P
-        log_path = _P(__file__).resolve().parent / "启动工具崩溃.log"
+        log_path = _P(__file__).resolve().parent / "绿泡泡聊天记录总结崩溃.log"
         try:
             log_path.write_text(_tb.format_exc(), encoding="utf-8")
         except Exception:

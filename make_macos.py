@@ -11,8 +11,8 @@
   python3 make_macos.py --dmg      # 额外打 .dmg 便于分发
 
 产物:
-  dist_mac/微信客户沟通总结工具.app
-  dist_mac/微信客户沟通总结工具.dmg (若 --dmg)
+  dist_mac/绿泡泡聊天记录总结.app
+  dist_mac/绿泡泡聊天记录总结.dmg (若 --dmg)
 
 说明:
   - 不含任何第三方组件; wx4「直读本机微信」数据源为 Windows 专属, macOS 端不支持该数据源,
@@ -25,11 +25,11 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-APP_NAME = "微信客户沟通总结工具"
+APP_NAME = "绿泡泡聊天记录总结"
 # 反向 DNS 形式的 bundle id(ASCII)。必须显式传给 PyInstaller:
 # 否则 PyInstaller 默认拿 --name 当 CFBundleIdentifier, 于是变成中文名,
 # 不符合 Apple 规范(会影响 LaunchServices / 偏好存储 / 公证)。
-BUNDLE_ID = "com.fenbeitong.wxcsm"
+BUNDLE_ID = "com.lvpaopao.wxcsm"
 OUT_DIR = os.path.join(HERE, "dist_mac")
 
 

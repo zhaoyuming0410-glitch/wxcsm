@@ -14,7 +14,9 @@ DEFAULTS: Dict[str, Any] = {
     "source": "wx4",
     "source_path": "",
     "self_names": [],                                 # 代表「我方」的发送人名：导入源（真实姓名无我方标记时）+ 解密数据库源（校正群聊归错人、统一显示名字）共用
+    "self_name_library": [],                          # 我方成员名称库：长期存同事名字的池子，供「选择我方成员」窗口勾选。与 self_names 分开——库里留着不一定这次要用
     "engine": "auto",                                  # auto | ai | offline
+    "output_format": "both",                           # both | summary | qa（见 pipeline.OUTPUT_FORMATS）
     "llm_base_url": "https://api.moonshot.cn/v1",
     "llm_model": "kimi-k2-turbo-preview",
     "llm_api_key": "",

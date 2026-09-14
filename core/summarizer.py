@@ -154,8 +154,8 @@ _PLEASANTRY = re.compile(r"^(嗯+|哦+|好的|好|行|那|额|哎|哈哈+|OK|ok)
 _CRUDE = re.compile(r"[艹草卧槽我靠妈蛋尼玛操靠]")
 # 微信表情占位(方括号包起来的中文表情名, 如 [捂脸]/[微笑]/[旺柴])
 _EMOTICON = re.compile(r"\[[^\]]{1,8}\]")
-# 群聊里的 @提及占位(如 @张凯、@王影王老师), 对句式衔接是噪音, 直接去掉
-# 匹配 @ 后不含空白/全角空格/标点的一段,避免 "@仇娱 Cynthia 仇老师" 只剩人名残留
+# 群聊里的 @提及占位(如 @张三、@李四李老师), 对句式衔接是噪音, 直接去掉
+# 匹配 @ 后不含空白/全角空格/标点的一段,避免 "@李四 Cynthia 李老师" 只剩人名残留
 _AT_MENTION = re.compile(r"@[^\s\u3000，。；：、,;:]{1,24}")
 # emoji 与扩展符号(含代理对、变体选择符、旗帜等)
 _EMOJI = re.compile(
@@ -190,9 +190,18 @@ _REDUNDANT_FILLER = re.compile(r"(也?(需要|得|必须要?)必须|必须必须
 # ---- 消息级噪音(在抽取前剥离,否则会把系统占位/发送人标签捕进总结) ----
 # 微信"引用/系统类型"占位,如 [类型244813135921]、[图片]、[视频]、[文件]
 _SYS_PLACEHOLDER = re.compile(r"\[[^\]]{0,40}\]")
-# 消息文本里带的发送人标签,如 "wxid_xxx: 内容"、"cherish_0823: 内容" 前缀
+# 消息文本里带的发送人标签,如 "wxid_xxx: 内容"、"cherish_0823: 内容" 前缀。
+# 字符集必须含 "@" 与 "."：企微/OpenIM 桥接账号形如 "10000000000000001@openim"，
+# 少了 "@" 就认不出这个标签，后面的 @提及清理会把 "@openim" 吃掉，
+# 只剩半截 "10000000000000001:" 永久留在正文里（真实数据里踩到过）。
 _SENDER_TAG = re.compile(
-    r"^(?:wxid_[A-Za-z0-9_-]+|[A-Za-z0-9_\u4e00-\u9fff]{1,24}):\s*")
+    # ASCII 账号形式：wxid_xxx / 10000000000000001@openim / cherish_0823
+    r"^\s*(?:wxid_[A-Za-z0-9_@.\-]+|[A-Za-z0-9_@.\-]{2,32}):\s*"
+    # 中文姓名形式：限制在 8 字内、冒号前一字符不是数字、冒号后不以数字开头。
+    # 不加这些限制，正文里的时间/日期会被当成发送人标签——
+    # 「我看您发的链接是11:00的」整段前缀被剥掉只剩「00的」，
+    # 「会议时间:2026/07/28」被剥成「2026/07/28」，都是静默丢内容。
+    r"|^\s*[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9_@.\-]{0,7}(?<!\d):(?!\d)\s*")
 # XML/HTML 标签(含引号/换行/未闭合,如 <img a="…">、<?xml…?>、<msg>…</msg>、<soun…)
 _XML_TAG = re.compile(r"<[^>\n]*>", re.S)
 # 仅剩 XML 开头(无闭合 `>` 的残缺标签,如 <soun、<appmsg) 及 <… 开头残留
@@ -200,6 +209,46 @@ _XML_BROKEN = re.compile(r"^<[A-Za-z][^\s]*")
 # 文件/音频/图片等附件名残留(如 飞书20260902-141958.qt、1789467209)
 _FILE_STUB = re.compile(r"[A-Za-z0-9_\u4e00-\u9fff]{6,}\.(qt|docx?|pdf|xlsx?|pptx?|mp4|mov|png|jpg|jpeg|amr|silk)$")
 _LONG_ID = re.compile(r"^\d{6,}$")
+# 消息里是否存在「真正的文字」：中日韩字符或拉丁字母。
+# 纯数字/符号的消息（"570"、"--"、"2026-09-11"）不承载对话含义，
+# 多半是 XML 标签值被剥掉后的拼接残渣。
+_HAS_TEXT = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7afA-Za-z]")
+# 企微/OpenIM 桥接号发来的图文消息（local_type 244813135921）把**真正的对话文字**
+# 放在 <title><![CDATA[…]]></title> 里，<type>57</type> 只是个数字标记。
+# 必须在 _XML_TAG 之前把它捞出来：_XML_TAG 是「< 到第一个 >」，会连 CDATA 正文一起
+# 吃掉，只留下 <type>57</type> 的 "57" 当正文——实测真实数据里有 10 行问答的
+# 「我方答复」就是这么变成一句 "57" 的（AI 拿到垃圾后只能写"已答复。"）。
+_CDATA_BODY = re.compile(
+    r"<(title|des)\b[^>]*>\s*(?:<!\[CDATA\[(.*?)\]\]>|([^<]*))\s*</\1>", re.S | re.I)
+_XML_ENTITIES = (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'),
+                 ("&apos;", "'"), ("&#39;", "'"), ("&amp;", "&"))
+
+
+def _extract_cdata_body(text: str) -> str:
+    """从企微图文消息里取出 title/des 正文；取不到返回空串。
+
+    正文有两种写法，真实数据里都出现过，必须都认：
+        <title><![CDATA[@王五 支付宝企业码和美团没有关系]]></title>
+        <title>我看您发的链接是11:00的</title>
+    title 优先于 des：聊天消息的 title 就是对方说的话，而卡片类消息的 des
+    只是"会议已开始"这种系统提示，两者都取会把系统提示当成对话内容。
+    """
+    title = des = ""
+    for m in _CDATA_BODY.finditer(text):
+        tag = m.group(1).lower()
+        body = (m.group(2) if m.group(2) is not None else (m.group(3) or "")).strip()
+        if not body:
+            continue
+        if tag == "title" and not title:
+            title = body
+        elif tag == "des" and not des:
+            des = body
+    out = title or des
+    for ent, ch in _XML_ENTITIES:
+        out = out.replace(ent, ch)
+    # 尾部偶尔粘着被截断的 XML 残渣里的裸数字（"\n\t\t57\n\t\t0\n\t\t0"）
+    out = re.sub(r"(?:\s*\d{1,3}){1,4}\s*$", "", out)
+    return re.sub(r"[ \t\r\n]+", " ", out).strip()
 
 
 def _strip_message_noise(text: str) -> str:
@@ -209,22 +258,41 @@ def _strip_message_noise(text: str) -> str:
     若不清掉, 总结会出现「[类型244813135921]」「<img …>」这类无效 token。
     清洗后若只剩 XML/媒体残渣或无业务文字, 返回空串由上层丢弃。
     """
+    # 先捞企微图文消息的 CDATA 正文（原因见 _CDATA_BODY 注释），必须在任何
+    # XML 标签剥离之前做，否则正文会被当标签整段吃掉。
+    cdata = _extract_cdata_body(text)
+    if cdata:
+        text = cdata
     text = _SENDER_TAG.sub("", text)
     # 去 XML 标签与 CDATA,再补删未闭合的残缺标签
     text = _XML_TAG.sub("", text)
     text = re.sub(r"<!\[CDATA\[.*?\]\]>", "", text, flags=re.S)
     text = re.sub(r"<\?[^>]*\?>", "", text, flags=re.S)
+    # 未闭合的 CDATA/注释残片：消息被截断时配对的 "]]>" 会缺失，上面那条规则删不掉，
+    # 字面 "<![CDATA[" 就会漏进正文（真实微信数据里确实出现过）。
+    text = text.replace("<![CDATA[", "").replace("]]>", "")
+    text = text.replace("<!--", "").replace("-->", "")
     text = _XML_BROKEN.sub("", text)
     text = _AT_MENTION.sub("", text)
     text = _EMOTICON.sub("", text)
     text = _EMOJI.sub("", text)
     text = _SYS_PLACEHOLDER.sub("", text)
+    # 发送人标签必须放在 XML/占位/@提及**都清完之后**再剥一次：
+    # 微信里它常被 "[类型xxx] " 或 XML 挡在前面（"[类型…] 2598…@openim:内容"），
+    # 前几轮剥离时它不在开头所以没命中；而 @提及清理又会把 "@openim" 吃掉，
+    # 于是只剩半截 id 混进正文。这里补最后一刀。
+    text = _SENDER_TAG.sub("", text)
     text = _FILE_STUB.sub("", text)
     text = _LONG_ID.sub("", text)
     text = text.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
     text = text.strip("，。；、： \t\n")
     # 若清洗后仍以 XML/媒体标记开头, 判为纯媒体无业务文字, 交由上层丢弃
     if not text or re.match(r"^\s*<", text):
+        return ""
+    # 没有任何文字（无中日韩字符、无字母）说明这只是一串数字/符号残渣，
+    # 典型来源是 XML 标签被剥掉后剩下的标签值拼接：<type>57</type><showtype>0</showtype>
+    # → "570"。它会被当成我方答复写进表格（真实数据里出现过），必须在这里拦掉。
+    if not _HAS_TEXT.search(text):
         return ""
     return text
 
@@ -265,7 +333,7 @@ def _clean_fact(text: str, strip_hints: bool = False) -> str:
             c = _TAIL_ACTION.sub("", c)
         # 去冗余强调填充词( 也必须/必须必须 )
         c = _REDUNDANT_FILLER.sub("", c)
-        # 去掉@提及(如 @王影王老师)与微信表情/emoji 占位(如 [捂脸]、😃)与零宽字符
+        # 去掉@提及(如 @李四李老师)与微信表情/emoji 占位(如 [捂脸]、😃)与零宽字符
         c = _AT_MENTION.sub("", c)
         c = _EMOTICON.sub("", c)
         c = _EMOJI.sub("", c)

@@ -30,7 +30,7 @@ import sys
 import time
 from pathlib import Path
 
-APP_NAME = "微信客户沟通总结工具"
+APP_NAME = "绿泡泡聊天记录总结"
 HERE = Path(__file__).resolve().parent
 
 _results: list[tuple[str, str, str]] = []  # (level, name, detail)

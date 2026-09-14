@@ -1,7 +1,7 @@
 """wxcsm 安装向导（自包含，无需外部安装器如 Inno/NSIS）。
 
 本文件被 PyInstaller 打成「安装程序」exe，运行时从自身尾部读取内嵌的 payload
-（zip：启动工具.exe + 卸载脚本），让用户选择安装目录、是否创建桌面快捷方式，
+（zip：绿泡泡聊天记录总结.exe + 卸载脚本），让用户选择安装目录、是否创建桌面快捷方式，
 然后解压并建快捷方式。
 
 payload 以固定标记 `WXCSM_PAYLOAD_V2\n` 开头紧跟 zip，拼接在 exe 之后，仅含程序本体。
@@ -21,9 +21,9 @@ import zipfile
 
 PAYLOAD_MARKER = b"WXCSM_PAYLOAD_V2\n"
 PAYLOAD_XOR_KEY = 0xAA
-APP_EXE = "启动工具.exe"
-APP_NAME = "微信客户沟通总结工具"
-DEFAULT_DIR = r"C:\Program Files\微信客户沟通总结工具"
+APP_EXE = "绿泡泡聊天记录总结.exe"
+APP_NAME = "绿泡泡聊天记录总结"
+DEFAULT_DIR = r"C:\Program Files\绿泡泡聊天记录总结"
 
 
 def _read_payload_zip() -> "zipfile.ZipFile":

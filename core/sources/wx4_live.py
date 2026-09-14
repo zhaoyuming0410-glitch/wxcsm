@@ -38,6 +38,10 @@ TYPE_MAP = {
 # ZSTD 压缩魔数
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
+# 明文库里"联系人"可能落在这些表名上（各版本命名不一，逐个碰）
+CONTACT_TABLES = ("contact", "wacontact", "wccontact", "china_link_contact",
+                  "friend_contact", "contact_v2")
+
 try:
     import zstandard as zstd
     _ZSTD_CTX = zstd.ZstdDecompressor()
@@ -61,6 +65,17 @@ class Wx4LiveSource(ChatSource):
         self._staged: Optional[Path] = None
         self._contacts: List[Contact] = []
         self._scanned = False
+        # 代表「我方」的发送人名字。群聊里"我方"往往不止账号本人：同事通过
+        # 企微/OpenIM 桥接号发言时，real_sender_id 指向的是同事而不是本人。
+        # 只看账号本人会把同事的答复当成客户发言 —— 问答清单会因此大面积显示
+        # "未答复（待跟进）"，叙述式总结也会把同事的进度当成客户诉求。
+        self._self_names = {str(s).strip() for s in (options.get("self_names") or [])
+                            if str(s).strip()}
+        # username -> {备注, 昵称, 别名, 账号}，让 self_names 可以填「张三」这样的人名，
+        # 而不用逼用户去查 wxid
+        self._name_of: Dict[str, set] = {}
+        # username -> 用于展示的名字（备注优先，与 list_contacts 的取名规则一致）
+        self._display_of: Dict[str, str] = {}
         # 可选的进度回调(由 GUI/CLI 注入, 用于展示取钥/解密进度); 默认静默
         self._progress_cb: Optional[Callable[[str], None]] = options.get("progress_cb")
 
@@ -242,30 +257,44 @@ class Wx4LiveSource(ChatSource):
                     "SELECT name FROM sqlite_master WHERE type='table'")]
                 # 粗筛: 只对明显是联系人/好友的表做结构探查, 跳过海量消息表
                 for tb in tables:
-                    tlow = tb.lower()
-                    if tlow not in ("contact", "wacontact", "wccontact", "china_link_contact",
-                                    "friend_contact", "contact_v2"):
+                    if tb.lower() not in CONTACT_TABLES:
                         continue
                     cols = [r[1] for r in con.execute(f'PRAGMA table_info("{tb}")')]
                     low = {c.lower(): c for c in cols}
                     u = low.get("username") or low.get("user_name")
                     nick = low.get("nickname") or low.get("nick_name")
                     remark = low.get("remark")
+                    alias = low.get("alias")
                     if not u:
                         continue
+                    picked = [c for c in (nick, remark, alias) if c]
+                    sel = ",".join(f'"{c}"' for c in picked)
                     try:
                         rows = con.execute(
-                            f'SELECT "{u}","{nick or u}","{remark or u}" FROM "{tb}"'
+                            f'SELECT "{u}"{"," + sel if sel else ""} FROM "{tb}"'
                         ).fetchall()
                     except sqlite3.Error:
                         continue
-                    for uid, nk, rk in rows:
-                        uid = (uid or "").strip()
-                        if not uid or uid.startswith(("gh_", "wxid_biz")):
+                    for row in rows:
+                        uid = (row[0] or "").strip()
+                        if not uid:
                             continue
+                        # 身份字典：备注/昵称/别名/账号都进 bag，供 self_names 做包含匹配。
+                        # 之所以要能包含匹配，是因为用户会填「张三」而备注实际是「张三 交付」。
+                        bag = self._name_of.setdefault(uid, set())
+                        bag.add(uid)
+                        for v in row[1:]:
+                            if v and str(v).strip():
+                                bag.add(str(v).strip())
+                        if uid.startswith(("gh_", "wxid_biz")):
+                            continue
+                        nk = (row[picked.index(nick) + 1] if nick in picked else "") or ""
+                        rk = (row[picked.index(remark) + 1] if remark in picked else "") or ""
+                        disp = (rk or "").strip() or (nk or "").strip() or uid
+                        self._display_of.setdefault(uid, disp)
                         contacts.setdefault(uid, Contact(
                             cid=uid,
-                            name=(rk or "").strip() or (nk or "").strip() or uid,
+                            name=disp,
                             kind="group" if uid.endswith("@chatroom") else "friend",
                             alias=(nk or "").strip() or ""))
             finally:
@@ -326,6 +355,14 @@ class Wx4LiveSource(ChatSource):
             except Exception:
                 pass
             
+            # 确保身份字典已就绪。不只在设了 self_names 时才建：展示名（备注/昵称）
+            # 对所有人都要生效——否则群聊记录里全是 "wxid_xxx：…"，
+            # 既污染总结正文、也让「原始记录」列没法核对是谁说的。
+            # （正常流程 list_contacts 已经建过；build_source 新建实例后这里兜底补建。）
+            if not self._name_of:
+                self._contacts = self._scan(root)
+                self._scanned = True
+
             con.row_factory = sqlite3.Row
             sql = (
                 f"SELECT m.local_type,m.create_time,m.message_content,"
@@ -341,7 +378,13 @@ class Wx4LiveSource(ChatSource):
             msgs = []
             for row in rows:
                 rid = row["real_sender_id"]
+                sender = row["sender_username"] or ""
                 is_sent = bool(self_rowid and rid == self_rowid)
+                if not is_sent and self._self_names:
+                    bag = self._name_of.get(sender)
+                    # 包含匹配（而非相等）：用户填「张三」，而备注实际是「张三 交付」
+                    if bag and any(sn in nm for nm in bag for sn in self._self_names):
+                        is_sent = True
                 ct = int(row["create_time"] or 0)
                 if ct > 100000000000: ct //= 1000
                 msg_text = self._decode_msg(row["compress_content"],
@@ -349,10 +392,13 @@ class Wx4LiveSource(ChatSource):
                                             int(row["local_type"] or 0))
                 msgs.append(Message(
                     ts=datetime.fromtimestamp(ct),
-                    sender=row["sender_username"] or "",
+                    # 展示名优先：否则群聊里会出现 "wxid_xxx：…" 这种不可读的发送人，
+                    # 既污染总结正文，也让原始记录没法核对是谁说的
+                    sender=self._display_of.get(sender, sender),
                     text=msg_text,
                     is_self=is_sent,
                     msg_type=TYPE_MAP.get(int(row["local_type"] or 0), f"type{row['local_type']}"),
+                    sender_id=sender,
                 ))
             return msgs
         finally:

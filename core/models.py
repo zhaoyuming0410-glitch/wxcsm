@@ -49,6 +49,9 @@ class Message:
     text: str
     is_self: bool = False
     msg_type: str = "text"         # text | image | file | voice | system ...
+    # 发送人的原始账号（wxid / xxx@openim）。`sender` 是可读展示名（备注/昵称），
+    # 两者要分开：判断"是不是企微桥接号"必须看账号，展示给人看要用名字。
+    sender_id: str = ""
 
     def line(self) -> str:
         who = "我" if self.is_self else (self.sender or "对方")
@@ -111,3 +114,49 @@ class Summary:
     @property
     def char_len(self) -> int:
         return len(re.sub(r"\s", "", self.content))
+
+
+# ---------- 客户问题答复清单（第二种输出形态） ----------
+# 与 Summary 的区别：Summary 是「一个对象+一个时间范围 → 一行叙述」；
+# QaItem 是「一个问题 → 一行」，因此同一对象会产出多行。
+QA_KINDS = ("提问", "需求", "报错", "投诉", "我方待办")
+QA_STATUS_DONE = "已答复"
+QA_STATUS_PENDING = "未答复（待跟进）"
+QA_STATUS_PROMISED = "已承诺（待跟进）"
+
+
+@dataclass
+class QaItem:
+    """问答清单的一行：客户提出的一个问题 + 我方的答复/处理。
+
+    kind 用来区分条目来源（见 QA_KINDS）。「我方待办」这类条目没有客户提问，
+    question 留空，内容放在 answer —— 这样同一张表既能看客户问过什么，
+    也能看我们自己认领了哪些事，且用户可按 kind 列筛选。
+    """
+
+    customer_name: str
+    kind: str = "提问"
+    question: str = ""
+    answer: str = ""
+    status: str = QA_STATUS_PENDING
+    raw: str = ""                        # 原始记录（客户原话 + 我方原话），便于核对
+    ask_ts: Optional[datetime] = None
+    answer_ts: Optional[datetime] = None
+    order: int = 0                       # 消息序号，用于保持时间先后
+
+    @staticmethod
+    def _fmt(ts: Optional[datetime]) -> str:
+        return f"{ts:%m-%d %H:%M}" if ts else "—"
+
+    @property
+    def ask_time(self) -> str:
+        return self._fmt(self.ask_ts)
+
+    @property
+    def answer_time(self) -> str:
+        return self._fmt(self.answer_ts)
+
+    @property
+    def question_cell(self) -> str:
+        """导出用：我方待办行没有客户提问，用「—」占位而不是空白，避免看起来像漏数据。"""
+        return self.question or "—"

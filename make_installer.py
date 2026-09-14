@@ -1,9 +1,9 @@
-"""生成可分发安装包：微信客户沟通总结工具_Setup.exe。
+"""生成可分发安装包：绿泡泡聊天记录总结_Setup.exe。
 
 流程：
   1) 用 PyInstaller 把 installer_main.py 打成单文件窗口 exe（请求管理员权限，便于写 Program Files）。
-  2) 把 启动工具.exe + 卸载.bat 打成 payload.zip（仅存储，不二次压缩）。
-  3) 拼接：installer.exe + 标记 + payload.zip  →  微信客户沟通总结工具_Setup.exe。
+  2) 把 绿泡泡聊天记录总结.exe + 卸载.bat 打成 payload.zip（仅存储，不二次压缩）。
+  3) 拼接：installer.exe + 标记 + payload.zip  →  绿泡泡聊天记录总结_Setup.exe。
 
 产物位于 dist_installer/，可直接发给他人在其他电脑双击安装。
 本工具内嵌数据仅含程序本身，不捆绑任何第三方组件。
@@ -18,14 +18,14 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYINSTALLER = "C:/Users/Administrator/.workbuddy/binaries/python/envs/wxcsm/Scripts/pyinstaller.exe"
-APP_EXE = os.path.join(HERE, "dist", "启动工具.exe")
+APP_EXE = os.path.join(HERE, "dist", "绿泡泡聊天记录总结.exe")
 OUT_DIR = os.path.join(HERE, "dist_installer")
 MARKER = b"WXCSM_PAYLOAD_V2\n"
 PAYLOAD_XOR_KEY = 0xAA
 UNINSTALL_BAT = (
     "@echo off\r\n"
-    "echo 正在卸载微信客户沟通总结工具…\r\n"
-    "echo 请先关闭正在运行的启动工具.exe\r\n"
+    "echo 正在卸载绿泡泡聊天记录总结…\r\n"
+    "echo 请先关闭正在运行的绿泡泡聊天记录总结.exe\r\n"
     "pause\r\n"
     'rmdir /s /q "%~dp0"\r\n'
     "echo 已卸载。桌面/开始菜单快捷方式请手动删除。\r\n"
@@ -45,7 +45,7 @@ def _verify_entry_script(exe_path: str, script_name: str) -> bool:
 
 def main() -> int:
     if not os.path.isfile(APP_EXE):
-        print(f"[错误] 找不到 {APP_EXE}，请先运行 PyInstaller 构建启动工具.exe", file=sys.stderr)
+        print(f"[错误] 找不到 {APP_EXE}，请先运行 PyInstaller 构建绿泡泡聊天记录总结.exe", file=sys.stderr)
         return 1
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -78,7 +78,7 @@ def main() -> int:
         return 1
 
     # 2) 打包 payload.zip（仅程序本体 + 卸载脚本，无任何第三方组件）
-    print("[2/3] 打包内嵌数据（启动工具 + 卸载脚本）…")
+    print("[2/3] 打包内嵌数据（绿泡泡聊天记录总结 + 卸载脚本）…")
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w", zipfile.ZIP_STORED) as z:
         z.write(APP_EXE, os.path.basename(APP_EXE))
@@ -88,10 +88,10 @@ def main() -> int:
 
     # 3) 拼接
     print("[3/3] 拼接为安装包…")
-    final = os.path.join(OUT_DIR, "微信客户沟通总结工具_Setup.exe")
+    final = os.path.join(OUT_DIR, "绿泡泡聊天记录总结_Setup.exe")
     with open(installer_exe, "rb") as f:
         head = f.read()
-    # 对 payload 做 XOR 混淆：防止内嵌的 启动工具.exe 尾部的 PyInstaller CArchive cookie
+    # 对 payload 做 XOR 混淆：防止内嵌的 绿泡泡聊天记录总结.exe 尾部的 PyInstaller CArchive cookie
     # 被外层 Setup.exe 的 bootloader 误识别为自身归档，导致双击直接启动 GUI。
     encoded_payload = bytes(b ^ PAYLOAD_XOR_KEY for b in payload_bytes)
     with open(final, "wb") as f:
