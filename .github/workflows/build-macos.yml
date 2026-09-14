@@ -67,8 +67,14 @@ jobs:
 
       - name: 构建 .app
         run: |
-          DMG_ARG=""
-          if [ "${{ inputs.with_dmg }}" = "true" ]; then DMG_ARG="--dmg"; fi
+          # 默认连 .dmg 一起打：.dmg 是首选分发格式（自包含，符号链接与权限位都完好）。
+          # 原先只在手动 workflow_dispatch 且勾选 with_dmg 时才加 --dmg，而 push 触发的
+          # 构建拿不到这个输入 —— 于是产物里只有 .app.tar.gz，没有 .dmg，而且校验那步
+          # 同样判断，把"缺 dmg"一起放过了。现在默认必打，手动触发时可显式关掉。
+          DMG_ARG="--dmg"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.with_dmg }}" = "false" ]; then
+            DMG_ARG=""
+          fi
           /usr/bin/python3 make_macos.py $DMG_ARG
 
       - name: "冒烟测试产物（demo 数据源，非 wx4）"
@@ -83,10 +89,12 @@ jobs:
 
       - name: "校验构建产物（.app 结构 / 符号链接 / 依赖 / .dmg / mac_wx4 自检 / 启动冒烟）"
         run: |
-          if [ "${{ inputs.with_dmg }}" = "true" ]; then
-            /usr/bin/python3 verify_macos.py --require-dmg
-          else
+          # 默认要求 .dmg 必须存在：它就是这次要分发的东西，缺了就该让构建失败，
+          # 而不是发一个只有 .app.tar.gz 的包出去（push 触发的构建曾经就是这样）。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.with_dmg }}" = "false" ]; then
             /usr/bin/python3 verify_macos.py
+          else
+            /usr/bin/python3 verify_macos.py --require-dmg
           fi
 
       - name: "打包 .app 为 tar.gz（保留符号链接与权限，避免 zip 传输损坏）"
