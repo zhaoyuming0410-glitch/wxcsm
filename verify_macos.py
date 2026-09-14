@@ -36,6 +36,14 @@ HERE = Path(__file__).resolve().parent
 _results: list[tuple[str, str, str]] = []  # (level, name, detail)
 
 
+def repo_version() -> str:
+    """读版本号。单一来源 core/__init__.py —— 界面标题栏显示的也是它。"""
+    sys.path.insert(0, str(HERE))
+    from core import __version__
+
+    return __version__
+
+
 def ok(name: str, detail: str = "") -> None:
     _results.append(("OK", name, detail))
     print(f"  [OK]   {name}" + (f" — {detail}" if detail else ""), flush=True)
@@ -168,6 +176,20 @@ def verify_app(app: Path) -> None:
             ok("CFBundleIdentifier 为反向 DNS 标识符", bid)
         if pl.get("LSMinimumSystemVersion"):
             ok("LSMinimumSystemVersion 已声明", str(pl["LSMinimumSystemVersion"]))
+
+        # 版本号必须和 core/__init__.py 一致。PyInstaller 默认写 0.0.0, 而窗口
+        # 标题显示 v2.2.0 —— 用户用 Finder「显示简介」核对版本时会得出错误结论,
+        # 所以这里卡死(make_macos.py 打完包会补写)。
+        want = repo_version()
+        got = str(pl.get("CFBundleShortVersionString") or "")
+        if not got:
+            fail("Info.plist 版本号已设置", "缺失")
+        elif got == want:
+            ok("Info.plist 版本与 core.__version__ 一致", got)
+        else:
+            fail("Info.plist 版本与 core.__version__ 一致",
+                 f"plist {got!r} != core {want!r} —— 检查 make_macos.py 的 "
+                 "set_bundle_version 是否执行过")
 
     # 架构: 必须与 runner 架构兼容(Apple silicon 上需 arm64 或 universal)
     if sys.platform == "darwin":

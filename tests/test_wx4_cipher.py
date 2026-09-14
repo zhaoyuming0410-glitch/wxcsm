@@ -144,10 +144,14 @@ def test_sanity_open():
 
 
 if __name__ == "__main__":
+    failed = 0
     for fn in [test_roundtrip, test_wrong_key_detected, test_plain_passthrough, test_sanity_open]:
         name = fn.__name__
         try:
             fn()
             print(f"  PASS  {name}", flush=True)
         except Exception as e:
+            failed += 1
             print(f"  FAIL  {name}: {e}", flush=True)
+    # 必须用退出码表示成败: 只打印 FAIL 的话, CI 和本地回归都会把它当成通过。
+    sys.exit(1 if failed else 0)

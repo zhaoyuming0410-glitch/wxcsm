@@ -43,7 +43,27 @@ jobs:
 
       - name: 语法自检(确保改动能 import)
         run: |
-          /usr/bin/python3 -c "import sys; sys.path.insert(0, '.'); import core.sources; import core.summarizer; import app; print('import OK on darwin:', sys.platform)"
+          # 逐个列出功能模块: 只 import app 其实也能覆盖, 但分开写在失败时能直接
+          # 看出是哪个模块坏了。新加的功能(问答清单/名称库/候选发现)都在这条线上。
+          /usr/bin/python3 - <<'PY'
+          import sys
+          sys.path.insert(0, '.')
+          import core.sources, core.summarizer, core.exporter
+          import core.qa_extract, core.qa_ai, core.name_library, core.self_discover
+          import cli, app
+          print('import OK on darwin:', sys.platform)
+          PY
+
+      - name: "单元测试（纯逻辑，不碰微信/网络/显示）"
+        run: |
+          # 这些用例只依赖标准库 + openpyxl, 在 runner 上可以实跑。
+          # 特意不含 test_ai_settings.py: 它会**真实调用大模型**(要配置 key 和网络),
+          # runner 上没有, 放进来只会让 CI 无故变红。
+          set -e
+          for t in test_qa_extract test_qa_ai test_name_library test_self_discover test_wx4_cipher test_macos_packaging; do
+            echo "===== $t ====="
+            /usr/bin/python3 "tests/$t.py"
+          done
 
       - name: 构建 .app
         run: |
@@ -55,6 +75,11 @@ jobs:
         run: |
           /usr/bin/python3 cli.py run --source demo --all --preset 30d --out /tmp/mac_demo.xlsx
           ls -lh /tmp/mac_demo.xlsx
+          # 名称库与 Excel 的闭环(导出模版 → 导回)也走一遍: 这条路径在 mac 上
+          # 同样是纯 Python + openpyxl, 没有平台差异, 但值得每次都验。
+          /usr/bin/python3 cli.py config --add-library "张三,李四" --export-template /tmp/tpl.xlsx
+          /usr/bin/python3 cli.py config --import-library /tmp/tpl.xlsx --force
+          ls -lh /tmp/tpl.xlsx
 
       - name: "校验构建产物（.app 结构 / 符号链接 / 依赖 / .dmg / mac_wx4 自检 / 启动冒烟）"
         run: |

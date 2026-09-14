@@ -20,6 +20,7 @@
   - 本脚本刻意不依赖 PyInstaller 以外的第三方(仅标准库)。
 """
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,37 @@ APP_NAME = "绿泡泡聊天记录总结"
 # 不符合 Apple 规范(会影响 LaunchServices / 偏好存储 / 公证)。
 BUNDLE_ID = "com.lvpaopao.wxcsm"
 OUT_DIR = os.path.join(HERE, "dist_mac")
+
+
+def read_version() -> str:
+    """读版本号。单一来源 core/__init__.py —— 界面标题栏显示的也是它。"""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from core import __version__
+
+    return __version__
+
+
+def set_bundle_version(app_path: str, version: str) -> str:
+    """把 .app 的 Info.plist 版本写成 version, 返回实际写入的值。
+
+    PyInstaller 除了 --osx-bundle-identifier 之外没有传元数据的命令行开关,
+    默认会把 CFBundleShortVersionString 写成 0.0.0。结果是 Finder「显示简介」
+    里版本是 0.0.0, 而窗口标题写着 v2.2.0 —— 用户想确认"我装的是不是新版"
+    时对不上号(Windows 版就因为版本号一直没变, 有人对着 6 天前的旧包找了半天)。
+    所以打完包补一次 plist。
+    """
+    plist = os.path.join(app_path, "Contents", "Info.plist")
+    if not os.path.isfile(plist):
+        raise FileNotFoundError(f"没有 Info.plist: {plist}")
+    with open(plist, "rb") as f:
+        info = plistlib.load(f)
+    # 两个键都写: ShortVersionString 是用户看到的, Version 是构建号。
+    info["CFBundleShortVersionString"] = version
+    info["CFBundleVersion"] = version
+    with open(plist, "wb") as f:
+        plistlib.dump(info, f)
+    return info["CFBundleShortVersionString"]
 
 
 def _log(*a):
@@ -63,6 +95,14 @@ def main():
         _log("[失败] 未生成 .app, 请确认已 pip install pyinstaller 且 python 带 tkinter。")
         sys.exit(1)
     _log(f"  ✅ .app 已生成: {app_path}")
+
+    # 版本号写进 Info.plist, 让 Finder「显示简介」和窗口标题一致
+    version = read_version()
+    try:
+        written = set_bundle_version(app_path, version)
+        _log(f"  ✅ Info.plist 版本已写为 {written}")
+    except Exception as e:                                          # noqa: BLE001
+        _log(f"  ⚠️ 写 Info.plist 版本失败: {e}")
 
     # 校验产物里确实含 tkinter, 避免打成"双击闪退/找不到 tk"的假包
     _log("[2/3] 校验产物包含 tkinter ...")
