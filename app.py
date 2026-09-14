@@ -110,6 +110,12 @@ def parse_curl_config(text: str) -> tuple:
     return url, model, key
 
 
+def brief(names) -> str:
+    """把长名单截断成一行——弹窗和提示行都要放得下，也不能一屏名字吓到人。"""
+    head = "、".join(names[:12])
+    return head if len(names) <= 12 else f"{head} 等共 {len(names)} 人"
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1768,11 +1774,6 @@ class App(tk.Tk):
                 foot2, text="导入后同时勾选为本次使用",
                 variable=var_use).pack(side="left")
 
-            def brief(names: list) -> str:
-                """名单太长就截断——弹窗要放得下，也不能一屏名字吓到人。"""
-                head = "、".join(names[:12])
-                return head if len(names) <= 12 else f"{head} 等共 {len(names)} 人"
-
             def replace_summary(filename: str, added: list, removed: list,
                                 total: int) -> str:
                 lines = [f"将按「{filename}」更新名称库：", ""]
@@ -1877,6 +1878,18 @@ class App(tk.Tk):
         ttk.Button(librow, text="导出 Excel 模版", width=15,
                    command=call_export_template).pack(side="left", padx=(6, 0))
 
+        selrow = ttk.Frame(win)
+        selrow.pack(fill="x", padx=12, pady=(0, 2))
+        ttk.Label(selrow, text="批量：").pack(side="left")
+        ttk.Button(selrow, text="全选", width=6,
+                   command=lambda: set_all(True)).pack(side="left", padx=(4, 0))
+        #   全不选是必须的：没有它，全选一次就得逐个点回来。
+        ttk.Button(selrow, text="全不选", width=8,
+                   command=lambda: set_all(False)).pack(side="left", padx=(4, 0))
+        ttk.Label(selrow, text="（点某一行即可勾选/取消，空格键也行；"
+                               "带 ☑ 的才是这次要用的）",
+                  style="Hint.TLabel").pack(side="left", padx=8)
+
         wrap = ttk.Frame(win)
         wrap.pack(fill="both", expand=True, padx=12)
         wrap.columnconfigure(0, weight=1)
@@ -1903,17 +1916,32 @@ class App(tk.Tk):
         lbl_sum = ttk.Label(win, textvariable=var_sum, style="Hint.TLabel",
                             wraplength=850, justify="left")
 
+        # 名字 -> 行号（iid）。行号就是 rows 里的序号，draw() 时重建，
+        # 用来 O(1) 定位某一行，省得每次勾选都遍历整张表。
+        iid_of: Dict[str, str] = {}
+
         def refresh_sum() -> None:
             names = [n for n, on in state.items() if on]
-            lbl_sum.configure(
-                text=(f"已选 {len(names)} 人：" + "、".join(names)) if names
-                else "已选 0 人：不填的话，群聊里同事的答复会被当成客户发言。")
+            if not names:
+                var_sum.set("已选 0 人：不填的话，群聊里同事的答复会被当成客户发言。")
+                return
+            # 名字一多就截断：全选之后几百个名字铺出来会把提示行撑爆
+            text = f"已选 {len(names)} 人：{brief(names)}"
+            # 勾了「不在名称库里」的人 = 扫描出来的候选，他们只是"可能是同事"。
+            # 认错了客户的发言会被当成我方答复，所以在这里点名提醒。
+            risky = [n for n in names if n not in library]
+            if risky:
+                text += (f"　⚠ 其中 {len(risky)} 个是扫描候选、还没进名称库"
+                         f"（{brief(risky)}），确认他们确实是同事")
+            var_sum.set(text)
 
         def draw() -> None:
             keep = tv.selection()
             tv.delete(*tv.get_children())
+            iid_of.clear()
             for i, name in enumerate(rows):
                 c = rows[name]
+                iid_of[name] = str(i)
                 tv.insert("", "end", iid=str(i),
                           values=("☑" if state.get(name) else "☐", c.name, c.cid,
                                   c.msg_count or "", "；".join(c.reasons)))
@@ -1921,14 +1949,55 @@ class App(tk.Tk):
                 tv.selection_set(keep[0])
             refresh_sum()
 
-        def toggle(_event=None):
+        def set_checked(name: str, on: bool) -> None:
+            state[name] = on
+            iid = iid_of.get(name)
+            if iid is not None:
+                tv.set(iid, "chk", "☑" if on else "☐")
+            refresh_sum()
+
+        def toggle_name(name: str) -> None:
+            set_checked(name, not state.get(name, False))
+
+        def name_of_iid(iid):
+            """行号 -> 名字；表可能刚被重画过，取不到就返回 None。"""
+            try:
+                return list(rows)[int(iid)]
+            except (TypeError, ValueError, IndexError):
+                return None
+
+        def on_click(event):
+            """点哪一行就切换哪一行的勾选。
+
+            这里必须用**坐标**取行（identify_row），不能读 tv.selection()：
+            控件自身的 <Button-1> 绑定先于 Treeview 的类绑定执行，而选中项是
+            类绑定才更新的。读 selection() 拿到的是"上一次点的行"，于是第一次
+            点击没反应、换一行点会勾错行、每行还得点两次。用坐标取行之后，
+            勾的和眼睛看到的是同一行。
+            """
+            if tv.identify_region(event.x, event.y) != "cell":
+                return                      # 表头、滚动条、表格空白处都不切换
+            iid = tv.identify_row(event.y)
+            name = name_of_iid(iid) if iid else None
+            if name is None:
+                return
+            tv.selection_set(iid)           # 行高亮，供「从名称库删除」判断对象
+            toggle_name(name)
+
+        def on_space(_event=None):
+            """空格键切换当前选中行（键盘操作）。"""
             sel = tv.selection()
             if not sel:
                 return
-            name = list(rows)[int(sel[0])]
-            state[name] = not state.get(name, False)
-            tv.set(sel[0], "chk", "☑" if state[name] else "☐")
-            refresh_sum()
+            name = name_of_iid(sel[0])
+            if name:
+                toggle_name(name)
+
+        def set_all(on: bool) -> None:
+            """全选 / 全不选：整表一起改再重画，保证表与汇总行一致。"""
+            for name in rows:
+                state[name] = on
+            draw()
 
         def add_manual(_event=None):
             """手动输入：同时勾上并存进名称库（用户主动输的，意图明确）。
@@ -2087,8 +2156,8 @@ class App(tk.Tk):
         ttk.Button(foot, text="取消", command=win.destroy).pack(side="right", padx=6)
         ttk.Button(foot, text="从名称库删除", command=remove_from_library).pack(
             side="right", padx=6)
-        tv.bind("<Button-1>", toggle)
-        tv.bind("<space>", toggle)
+        tv.bind("<Button-1>", on_click)
+        tv.bind("<space>", on_space)
 
         # 复用上次扫到的候选，避免每次开窗都重扫一遍
         for c in getattr(self, "self_candidates", []) or []:

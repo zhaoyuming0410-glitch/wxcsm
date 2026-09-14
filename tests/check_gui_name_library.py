@@ -170,11 +170,15 @@ note("名称库" in vals.get("王五", ["", "", "", "", ""])[4],
      "来源列标注为名称库")
 
 print("【5】勾上库里的王五 + 手动加一个新同事，再确定")
+# 按真实行坐标点：空事件（x/y 都是 0）会落在表头上，按坐标取行的实现会忽略它。
+# 以前这里先 selection_set 再发空事件，恰好喂给旧实现"上一次的选中行"，把 bug 掩盖了。
 for i in tv2.get_children():
     if tv2.item(i, "values")[1] == "王五":
-        tv2.selection_set(i)
+        _bb = tv2.bbox(i)
+        assert _bb, "王五那一行不在可见区域，点不到"
+        tv2.event_generate("<Button-1>", x=_bb[0] + _bb[2] // 2,
+                           y=_bb[1] + _bb[3] // 2, when="now")
         break
-tv2.event_generate("<Button-1>", when="now")
 a2.update()
 ent = find(t2, tk.ttk.Entry)[0]
 ent.insert(0, "新同事小王")

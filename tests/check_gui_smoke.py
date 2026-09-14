@@ -25,6 +25,7 @@ import tkinter as tk
 
 from core.models import (QA_STATUS_DONE, QA_STATUS_PENDING, QA_STATUS_PROMISED,
                          Contact, QaItem, Summary)
+from core.self_discover import Candidate
 
 import app as appmod
 
@@ -250,6 +251,37 @@ def main() -> int:
         assert tv, "没有找到候选表"
         return tv[0], [tv[0].item(i, "values") for i in tv[0].get_children()]
 
+    def click_row(tree, name_or_iid):
+        """真的去点某一行：按行坐标发 Button-1。
+
+        不能只 selection_set 再发一个空事件——空事件的 x/y 都是 0（落在表头上），
+        按坐标取行的实现会正确地忽略它，测试就成了空转。
+        """
+        iid = name_or_iid
+        for i in tree.get_children():
+            if i == name_or_iid or tree.item(i, "values")[1] == name_or_iid:
+                iid = i
+                break
+        bb = tree.bbox(iid)
+        assert bb, f"行 {iid} 不在可见区域，点不到（bbox 为空）"
+        x, y, w, h = bb
+        tree.event_generate("<Button-1>", x=x + w // 2, y=y + h // 2, when="now")
+
+    def sum_text(t):
+        """读「已选 N 人…」汇总行。它挂的是 textvariable，cget("text") 是空的。"""
+        out = []
+        for w in find_widgets(t, tk.ttk.Label):
+            var = str(w.cget("textvariable") or "")
+            if not var:
+                continue
+            try:
+                txt = str(t.getvar(var))
+            except tk.TclError:
+                continue
+            if "已选" in txt:
+                out.append(txt)
+        return out[-1] if out else ""
+
     a.cfg["self_name_library"] = ["张三", "李四"]
     a.var_self_names.set("王五")
     a.self_candidates = []
@@ -440,6 +472,89 @@ def main() -> int:
 
     check("名称库：确定后勾选生效、名称库保持「以文件为准」、被移除的不复活",
           confirm_persists_library)
+
+    def click_toggles_clicked_row():
+        """点哪一行就勾哪一行。
+
+        老实现读的是 tv.selection()，而选中项要等 Treeview 的**类绑定**才更新，
+        控件自身的 <Button-1> 先执行——于是读到的是"上一次点的行"：
+        换一行点会勾错行，每行还得点两次。这里特意先选中另一行再点这一行，
+        就是为了复现那个错位。
+        """
+        a.self_candidates = []
+        a._open_self_picker()
+        a.update()
+        tw = picker_window()
+        tvw = rows_of(tw)[0]
+        try:
+            ids = list(tvw.get_children())
+            assert len(ids) >= 2, f"表里至少要有两行才能验证：{len(ids)}"
+            first, second = ids[0], ids[1]
+            before = {i: tvw.item(i, "values")[0] for i in ids}
+
+            tvw.selection_set(first)        # 制造"选中项 ≠ 要点的行"
+            a.update()
+            click_row(tvw, second)
+            a.update()
+
+            after = {i: tvw.item(i, "values")[0] for i in ids}
+            changed = [i for i in ids if before[i] != after[i]]
+            assert changed == [second], (
+                f"点第 2 行却改动了 {changed}（应只有 {[second]}）——"
+                "又变成了「读到上一次选中行」的老毛病")
+        finally:
+            tw.destroy()
+            a.update()
+
+    check("勾选：点哪行就勾哪行（不会勾成上一次点的那行）", click_toggles_clicked_row)
+
+    def select_all_and_none():
+        """全选 / 全不选，以及汇总行要跟着变。"""
+        # 放一个"扫描候选"进去：它不在名称库里，勾上它就该出安全提醒
+        a.self_candidates = [Candidate(name="可疑客户", cid="wxid_kehu",
+                                       msg_count=9, reasons=["扫描候选"])]
+        try:
+            a._open_self_picker()
+            a.update()
+            tw = picker_window()
+            tvw = rows_of(tw)[0]
+            try:
+                ids = list(tvw.get_children())
+                assert ids, "表是空的"
+                # 多出来的「批量」行不能把候选表挤到不可用
+                h = tvw.winfo_height()
+                assert h >= 120, f"「批量」行把候选表挤得太小了：只有 {h}px"
+                # 先弄成"部分勾选"，免得本来就已经全勾、全选看不出效果
+                click_row(tvw, ids[0])
+                a.update()
+                marks = [tvw.item(i, "values")[0] for i in ids]
+                assert "☑" in marks and "☐" in marks, \
+                    f"需要「部分勾选」的前置状态，实际是 {marks}"
+
+                find_widgets(tw, tk.ttk.Button, "全选")[0].invoke()
+                a.update()
+                got = [tvw.item(i, "values")[0] for i in ids]
+                assert got == ["☑"] * len(ids), f"全选后有没勾上的：{got}"
+                txt = sum_text(tw)
+                assert f"已选 {len(ids)} 人" in txt, f"全选后汇总行不对：{txt}"
+                # 候选不在名称库里 → 必须提醒（认错了客户发言会被当成我方答复）
+                assert "⚠" in txt and "可疑客户" in txt, \
+                    f"勾上扫描候选却没提醒：{txt}"
+
+                find_widgets(tw, tk.ttk.Button, "全不选")[0].invoke()
+                a.update()
+                got = [tvw.item(i, "values")[0] for i in ids]
+                assert got == ["☐"] * len(ids), f"全不选后还有勾着的：{got}"
+                txt = sum_text(tw)
+                assert "已选 0 人" in txt, f"全不选后汇总行不对：{txt}"
+            finally:
+                tw.destroy()
+                a.update()
+        finally:
+            a.self_candidates = []
+
+    check("勾选：「全选 / 全不选」能勾上或清空整表，汇总行跟着变",
+          select_all_and_none)
 
     # ---- 扫描：这条路径曾经整条失效（轮询循环没被启动）----
     # 症状是点「开始扫描」后永远停在"正在准备…"，后台其实抓到了数据，
