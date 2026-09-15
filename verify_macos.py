@@ -413,6 +413,32 @@ def verify_mac_wx4() -> None:
 
 # ---------------------------------------------------------------- 启动冒烟
 
+def _grab_screenshot(app: Path) -> None:
+    """趁 App 还活着截一张窗口图, 放到 dist_mac/ 里让 artifact 一起带走。
+
+    为什么值得做: 这个 .app 只有在**对应架构的真 Mac** 上才跑得起来 ——
+    arm64 包在 Intel 机器上连双击都打不开(会显示禁止符)。于是"界面到底长什么样、
+    布局有没有崩"过去只能靠人找一台同架构的 Mac 去看。
+    而 runner 上既然能把 tkinter 窗口拉起来(否则进程会秒退), 说明有图形会话,
+    截图就能拿到真实渲染结果 —— 图给 AI 一看, 界面问题当场就能定位,
+    不必再让人去找机器。
+
+    失败只告警: 有些机器上 screencapture 受隐私保护限制, 截出来是黑的或直接失败。
+    """
+    out = HERE / "dist_mac" / "app_screenshot.png"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.exists():
+            out.unlink()
+        rc, msg = run(["screencapture", "-x", str(out)], timeout=60)
+        if rc == 0 and out.is_file() and out.stat().st_size > 1024:
+            ok("窗口截图已生成", f"{out.name} ({out.stat().st_size/1024:.0f} KB)")
+        else:
+            warn("窗口截图", f"screencapture 未产出有效文件 rc={rc}: {msg.strip()[:120]}")
+    except Exception as e:                                          # noqa: BLE001
+        warn("窗口截图", str(e)[:120])
+
+
 def verify_launch(app: Path) -> None:
     print("\n[4] 启动冒烟(拉起 .app 观察是否秒退)", flush=True)
     macos_dir = app / "Contents" / "MacOS"
@@ -443,6 +469,8 @@ def verify_launch(app: Path) -> None:
 
     if alive:
         ok("进程启动后存活 10s", "未秒退")
+        # 趁还活着截图: 这是"真机上界面长什么样"的唯一自动化证据
+        _grab_screenshot(app)
         proc.terminate()
         try:
             proc.wait(timeout=10)

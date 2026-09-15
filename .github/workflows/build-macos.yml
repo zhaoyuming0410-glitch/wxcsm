@@ -138,5 +138,6 @@ jobs:
           path: |
             dist_mac/*.dmg
             dist_mac/*.app.tar.gz
+            dist_mac/*.png
           if-no-files-found: warn
           retention-days: 30
