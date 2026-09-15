@@ -30,9 +30,28 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # 两个架构各出一个包:
+    #   arm64   —— Apple 芯片的 Mac 用(macos-latest 就是 arm64 runner)
+    #   x86_64  —— Intel Mac、以及在 Windows 上跑的 macOS 虚拟机用
+    #     (macOS 虚拟机必然是 Intel 架构, arm64 的 .app 在它上面会被打上禁止符、
+    #      根本打不开 —— Rosetta 只能把 x86 翻成 arm64, 反不过来)
+    # 两个 job 互不影响: 一个失败不影响另一个出产物(fail-fast: false)。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-13
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: 记录本次目标架构
+        run: |
+          echo "目标架构: ${{ matrix.arch }}"
+          uname -m
 
       - name: 准备 Python(系统 python3 自带 tkinter)
         run: |
@@ -98,15 +117,21 @@ jobs:
           fi
 
       - name: "打包 .app 为 tar.gz（保留符号链接与权限，避免 zip 传输损坏）"
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           cd dist_mac
-          tar -czf "绿泡泡聊天记录总结.app.tar.gz" "绿泡泡聊天记录总结.app"
+          tar -czf "绿泡泡聊天记录总结-${ARCH}.app.tar.gz" "绿泡泡聊天记录总结.app"
+          # 文件名带上架构：arm64 与 x86_64 两个 artifact 里如果都是同名 dmg，
+          # 下载下来根本分不清哪个是给谁的。放在 verify 之后改名，免得影响校验。
+          mv "绿泡泡聊天记录总结.dmg" "绿泡泡聊天记录总结-${ARCH}.dmg" 2>/dev/null || true
           ls -lh *.tar.gz *.dmg 2>/dev/null || ls -lh
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: wxcsm-macos
+          # 名字带架构：下载页上就能分清该拿哪个（Apple 芯片拿 arm64，Intel/虚拟机拿 x86_64）
+          name: wxcsm-macos-${{ matrix.arch }}
           path: |
             dist_mac/*.dmg
             dist_mac/*.app.tar.gz
