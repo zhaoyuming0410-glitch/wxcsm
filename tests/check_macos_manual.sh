@@ -343,8 +343,6 @@ finish
 
 printf '\n%s报告已生成：%s%s\n' "$BOLD" "$REPORT" "$RESET"
 printf '%s截图请放进：%s%s\n\n' "$BOLD" "$REPORT_DIR" "$RESET"
-printf '%s把整个文件夹拷回 Windows 的这个位置，AI 就能直接读：%s\n' "$BOLD" "$RESET"
-printf '  D:\\Software\\wxcsm-macos\\验收反馈\\\n\n'
-printf '%s最省事的回传方式：%s\n' "$BOLD" "$RESET"
-printf -- '  · 用共享文件夹 / U 盘 / 网盘，把 %s 整个目录拷过去\n' "$REPORT_DIR"
+printf '%s把整个文件夹交给 AI：%s\n' "$BOLD" "$RESET"
+printf -- '  · 用共享文件夹 / U 盘 / 网盘，把 %s 整个目录拷到约定的接收目录\n' "$REPORT_DIR"
 printf -- '  · 或者把「验收报告.md」的内容直接粘到对话里（截图单独发）\n\n'
