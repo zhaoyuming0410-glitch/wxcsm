@@ -42,7 +42,10 @@ jobs:
         include:
           - runner: macos-latest
             arch: arm64
-          - runner: macos-13
+          # Intel 用 macos-15-intel：旧的 macos-13 标签已进入退役流程，
+          # 实测排队 35 分钟都分配不到 runner(不是失败，是一直没机器)。
+          # macos-15-intel 是 GitHub 现在给 Intel 机器的正式标签。
+          - runner: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
